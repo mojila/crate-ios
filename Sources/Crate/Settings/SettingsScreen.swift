@@ -144,6 +144,7 @@ struct SettingsScreen: View {
                 Text(Format.memory(memory.physical))
                     .monospacedDigit()
             }
+            NavigationLink("Memory Stats") { MemoryStatsScreen() }
         } header: {
             Text("Memory")
         } footer: {

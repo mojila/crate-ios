@@ -47,3 +47,52 @@ struct MemoryReport {
         return result == KERN_SUCCESS ? info.phys_footprint : 0
     }
 }
+
+/// The whole device's RAM, not just crate's share: total, used and available,
+/// read from the kernel. Used is everything the system can't hand out right
+/// away (active, wired and compressed); available is free pages plus inactive
+/// pages the system can reclaim, so the two add up to the total.
+struct DeviceMemory {
+    /// Whether the kernel gave figures at all. The Simulator sometimes says no.
+    let isReported: Bool
+    let total: UInt64
+    let used: UInt64
+    let available: UInt64
+
+    /// How much of the device's RAM is in use, 0...1, for a progress bar.
+    var usedFraction: Double {
+        guard total > 0 else { return 0 }
+        return min(1, Double(used) / Double(total))
+    }
+
+    init() {
+        total = ProcessInfo.processInfo.physicalMemory
+
+        var stats = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let host = mach_host_self()
+        let result = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(host, HOST_VM_INFO64, $0, &count)
+            }
+        }
+        mach_port_deallocate(mach_task_self_, host)
+        guard result == KERN_SUCCESS else {
+            // No kernel figures (the Simulator can be like this): report the
+            // total and leave the rest unknown rather than inventing numbers.
+            isReported = false
+            used = 0
+            available = 0
+            return
+        }
+
+        isReported = true
+        let page = UInt64(vm_kernel_page_size)
+        // Speculative pages are already counted in free_count.
+        let free = UInt64(stats.free_count) * page
+        let reclaimable = UInt64(stats.inactive_count) * page
+        available = min(total, free + reclaimable)
+        used = total - available
+    }
+}

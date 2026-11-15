@@ -137,8 +137,8 @@ Three tabs:
   menu has the VM's settings (on iPhone Duo) and Delete.
 - **Install Vms**: the images the catalog lists, a memory limit, and Install,
   which asks for the account to make in the VM.
-- **Settings**: JIT, memory, logs, and Acknowledgements: the licenses of
-  crate and of everything it carries.
+- **Settings**: JIT, memory and live memory stats, logs, and
+  Acknowledgements: the licenses of crate and of everything it carries.
 
 ## JIT
 
