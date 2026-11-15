@@ -170,11 +170,15 @@ final class MachineRunner {
         /// What the VM asked for, unless that wouldn't fit beside the app in
         /// what iOS lets crate have: the code region is already in the app's
         /// footprint, and the guest's memory counts as it touches it.
+        /// Headroom covers the app plus the JIT code region (up to 1 GiB):
+        /// without the increased-memory-limit entitlement iOS caps crate near
+        /// 3 GiB, where 768 left a ~1.2 GiB guest tripping iOS's low-memory
+        /// warning.
         static func memory(askedGB: Int) -> Int {
             let asked = askedGB * 1024
             let available = Int(os_proc_available_memory() >> 20)
             guard available > 0 else { return asked }
-            let headroom = 768
+            let headroom = 1024
             let fits = max(1024, (available - headroom) / 2 * 2)
             return min(asked, fits)
         }

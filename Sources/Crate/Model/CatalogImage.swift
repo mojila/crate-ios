@@ -77,7 +77,7 @@ struct Catalog: Decodable {
     let images: [CatalogImage]
 
     /// The latest release's catalog.
-    static let url = URL(string: "https://github.com/oneamendez/arm64-desktop-images/releases/latest/download/catalog.json")!
+    static let url = URL(string: "https://github.com/mojila/arm64-desktop-images/releases/latest/download/catalog.json")!
 
     static func fetch() async throws -> Catalog {
         var request = URLRequest(url: url)

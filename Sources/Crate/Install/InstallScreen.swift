@@ -22,8 +22,10 @@ struct InstallScreen: View {
     @State private var askingForAccount = false
     @State private var confirmingCancel = false
 
-    /// The memory limits a VM can have, here and in its settings.
-    static let memoryChoices = [4, 6, 8]
+    /// The memory limits a VM can have, here and in its settings. 2 GB is for
+    /// builds without the increased-memory-limit entitlement, where iOS caps
+    /// crate near 3 GiB (INSTALL.md: pick a smaller size there).
+    static let memoryChoices = [2, 4, 6, 8]
 
     /// The disk sizes the slider stops at, for the selected image.
     private var diskStops: [Int] {
