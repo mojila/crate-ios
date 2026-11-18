@@ -53,7 +53,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Home lists installed operating systems — tap **Boot** on one to start it
-immediately (one machine per process: Boot is gated while a VM lives). A
+immediately (one machine per process: Boot is gated while a VM lives). Each
+row also has **Edit** (memory 2/4/6/8 GB applies instantly for the next
+boot; disk size + login reset **without re-downloading** — Prepare extends
+the disk and rewrites the seed in place, then one guest command pasted from
+the action-bar Build button makes the next boot a cloud-init first boot
+again; needs the current password. **Erase & reinstall** re-downloads the
+image into the same entry when that login is lost — the images switch
+cloud-init off after first boot, so a re-seed alone never takes effect; the
+old files are kept as a backup until the new disk verifies) and **Delete**
+(two-tap confirm, removes the VM's whole folder). Both hide while a VM
+runs — Kill first. A
 display boot goes fullscreen: status and buttons hide, the guest owns the
 screen. The floating button (top-right) brings controls back; its
 fullscreen button hides them again.
@@ -87,7 +97,9 @@ disk parts, each SHA-256-checked), unpacks the disk sparsely (Rust
 whole stream hashed), verifies the disk digest, grows it to 12 GiB, and
 writes the cloud-init NoCloud `seed.img` (FAT12 `CIDATA`: user-data with a
 SHA-512-crypt password hash, meta-data, vendor-data). Mirrors iOS
-`Installer`/`DiskUnpacker`/`SeedDisk` 1:1.
+`Installer`/`DiskUnpacker`/`SeedDisk` 1:1. The New-machine form picks RAM
+(2/4/6/8 GB) and disk (12–64 GB sparse) plus user/password/hostname —
+no more hardcoded 4G/12G.
 
 VMs live in internal storage (`filesDir/VMs/<uuid>/`: `vmlinuz`,
 `initrd.img`, `disk.img`, `seed.img`, `machine.json`) — internal storage is

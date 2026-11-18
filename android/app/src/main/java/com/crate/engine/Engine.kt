@@ -70,6 +70,37 @@ class Engine {
     private val main = Handler(Looper.getMainLooper())
     private val buffer = StringBuilder()
 
+    // Frame decode runs here, not on the engine GPU thread: onFrame used to
+    // run a ~1M-pixel Kotlin loop + Bitmap alloc synchronously on the GPU
+    // callback thread, so a flood of cursor-move frames stalled the display
+    // pipeline and the mouse visibly lagged. Now onFrame only enqueues the
+    // newest buffer; the decoder drops anything superseded.
+    private data class PendingFrame(
+        val width: Int,
+        val height: Int,
+        val stride: Int,
+        val pixels: ByteArray,
+        val dx: Int,
+        val dy: Int,
+        val dw: Int,
+        val dh: Int,
+    )
+
+    private val pendingFrame = java.util.concurrent.atomic.AtomicReference<PendingFrame?>()
+    private val frameDecode = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "frame-decode").apply { isDaemon = true }
+    }
+    // Reused across same-size frames: no per-frame alloc; only the dirty
+    // rect is decoded and uploaded (cursor moves touch KBs, not MBs).
+    private var argbBuf = IntArray(0)
+    private var frameBmp: Bitmap? = null
+
+    // Input dedupe: hover floods the UI thread with moves; identical
+    // repeats skip the JNI round-trip (buttons included in the key).
+    private var lastPX = -1
+    private var lastPY = -1
+    private var lastPB = -1
+
     @Volatile
     private var destroyed = false
 
@@ -110,7 +141,13 @@ class Engine {
 
     fun sendKey(code: Int, down: Boolean) = nativeSendKey(id, code, down)
 
-    fun sendPointer(x: Int, y: Int, buttons: Int) = nativeSendPointer(id, x, y, buttons)
+    fun sendPointer(x: Int, y: Int, buttons: Int) {
+        if (x == lastPX && y == lastPY && buttons == lastPB) return
+        lastPX = x
+        lastPY = y
+        lastPB = buttons
+        nativeSendPointer(id, x, y, buttons)
+    }
 
     fun sendScroll(dx: Int, dy: Int) = nativeSendScroll(id, dx, dy)
 
@@ -174,29 +211,80 @@ class Engine {
         dirtyHeight: Int,
     ) {
         // Stride is bytes per row; pixels are R,G,B,unused. Guard against a
-        // torn frame (zero size or short buffer) and drop it.
+        // torn frame (zero size or short buffer) and drop it. Only the
+        // newest buffer is kept — the decoder takes-and-clears, so a backlog
+        // of cursor-move frames collapses instead of queueing.
         if (width <= 0 || height <= 0 || stride < width * 4) return
         if (pixels.size < stride * (height - 1) + width * 4) return
-        val argb = IntArray(width * height)
-        var i = 0
-        for (y in 0 until height) {
-            val row = y * stride
-            for (x in 0 until width) {
-                val o = row + x * 4
-                val r = pixels[o].toInt() and 0xff
-                val g = pixels[o + 1].toInt() and 0xff
-                val b = pixels[o + 2].toInt() and 0xff
-                argb[i++] = 0xff000000.toInt() or (r shl 16) or (g shl 8) or b
-            }
+        pendingFrame.set(PendingFrame(width, height, stride, pixels,
+            dirtyX, dirtyY, dirtyWidth, dirtyHeight))
+        frameDecode.execute {
+            val f = pendingFrame.getAndSet(null) ?: return@execute
+            decodeAndPublish(f)
         }
-        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        bmp.setPixels(argb, 0, width, 0, 0, width, height)
-        val image = bmp.asImageBitmap()
+    }
+
+    /** Decodes (dirty rect only) on the decode thread; uploads on main. */
+    private fun decodeAndPublish(f: PendingFrame) {
+        val w = f.width
+        val h = f.height
+        var bmp = frameBmp
+        if (argbBuf.size != w * h || bmp == null || bmp.width != w || bmp.height != h) {
+            argbBuf = IntArray(w * h)
+            bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            frameBmp = bmp
+            decodeRect(f, 0, 0, w, h)
+            main.post {
+                bmp.setPixels(argbBuf, 0, w, 0, 0, w, h)
+                frameWidth = w
+                frameHeight = h
+                frameImage = bmp.asImageBitmap()
+                framesSeen++
+            }
+            return
+        }
+        // Clamp the dirty rect; fall back to full on nonsense.
+        val dx = f.dx.coerceIn(0, w - 1)
+        val dy = f.dy.coerceIn(0, h - 1)
+        val dw = f.dw.coerceAtLeast(0).coerceAtMost(w - dx)
+        val dh = f.dh.coerceAtLeast(0).coerceAtMost(h - dy)
+        if (dw <= 0 || dh <= 0) {
+            decodeRect(f, 0, 0, w, h)
+            main.post {
+                bmp.setPixels(argbBuf, 0, w, 0, 0, w, h)
+                frameWidth = w
+                frameHeight = h
+                frameImage = bmp.asImageBitmap()
+                framesSeen++
+            }
+            return
+        }
+        decodeRect(f, dx, dy, dw, dh)
         main.post {
-            frameWidth = width
-            frameHeight = height
-            frameImage = image
+            bmp.setPixels(argbBuf, dy * w + dx, w, dx, dy, dw, dh)
+            frameWidth = w
+            frameHeight = h
+            frameImage = bmp.asImageBitmap()
             framesSeen++
+        }
+    }
+
+    /** R,G,B,unused bytes → opaque ARGB ints, over [dx, dx+dw) × [dy, dy+dh). */
+    private fun decodeRect(f: PendingFrame, dx: Int, dy: Int, dw: Int, dh: Int) {
+        val px = f.pixels
+        val stride = f.stride
+        val w = f.width
+        for (y in dy until dy + dh) {
+            val row = y * stride
+            var i = y * w + dx
+            for (x in dx until dx + dw) {
+                val o = row + x * 4
+                if (o + 3 >= px.size) break
+                val r = px[o].toInt() and 0xff
+                val g = px[o + 1].toInt() and 0xff
+                val b = px[o + 2].toInt() and 0xff
+                argbBuf[i++] = 0xff000000.toInt() or (r shl 16) or (g shl 8) or b
+            }
         }
     }
 

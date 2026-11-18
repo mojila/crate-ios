@@ -45,6 +45,8 @@ fun InstallPanel(
     var user by remember { mutableStateOf("owner") }
     var password by remember { mutableStateOf("") }
     var hostname by remember { mutableStateOf("crate") }
+    var memoryGB by remember { mutableStateOf(4) }
+    var diskGB by remember { mutableStateOf(12) }
 
     LaunchedEffect(Unit) {
         Thread({
@@ -93,6 +95,36 @@ fun InstallPanel(
         selected?.let { img ->
             SectionCard("New machine") {
                 Text("Install ${img.id} (${img.downloadBytes shr 20} MiB download)", fontSize = 14.sp)
+                Text("Memory", fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    for (gb in listOf(2, 4, 6, 8)) {
+                        Row {
+                            TipIconButton(
+                                icon = if (gb == memoryGB) Icons.Filled.RadioButtonChecked
+                                    else Icons.Filled.RadioButtonUnchecked,
+                                tip = "$gb GB RAM",
+                                onClick = { memoryGB = gb },
+                                enabled = !installer.busy,
+                            )
+                            Text("${gb}G", fontSize = 12.sp)
+                        }
+                    }
+                }
+                Text("Disk (sparse, grows as the guest writes)", fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    for (gb in listOf(12, 16, 24, 32, 48, 64)) {
+                        Row {
+                            TipIconButton(
+                                icon = if (gb == diskGB) Icons.Filled.RadioButtonChecked
+                                    else Icons.Filled.RadioButtonUnchecked,
+                                tip = "$gb GB disk",
+                                onClick = { diskGB = gb },
+                                enabled = !installer.busy,
+                            )
+                            Text("${gb}G", fontSize = 12.sp)
+                        }
+                    }
+                }
                 TextField(value = user, onValueChange = { user = it },
                     label = { Text("user") }, singleLine = true)
                 TextField(value = password, onValueChange = { password = it },
@@ -105,7 +137,7 @@ fun InstallPanel(
                         icon = Icons.Filled.Download,
                         tip = "Install",
                         onClick = {
-                            installer.install(img, 4, 12, user, password, hostname)
+                            installer.install(img, memoryGB, diskGB, user, password, hostname)
                         },
                         enabled = !installer.busy && user.isNotBlank() && password.isNotEmpty(),
                         filled = true,

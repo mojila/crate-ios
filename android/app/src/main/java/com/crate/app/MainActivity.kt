@@ -42,13 +42,21 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -82,6 +90,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -92,10 +101,24 @@ import com.crate.engine.LinuxKeys
 import com.crate.engine.NativeLibs
 import com.crate.install.InstallPanel
 import com.crate.install.Installer
+import com.crate.install.CatalogImage
+import com.crate.install.Machine
+import com.crate.install.fetchCatalog
 import java.io.File
 
 /** Top menu. Home (the console) is selected by default. */
 private enum class Tab { Home, Install, Settings }
+
+/**
+ * Run inside the guest (as the current user, it asks for the password) to
+ * make the next boot a cloud-init first boot again: wipes cloud-init's
+ * finished state + its off-switch, grows the filesystem into a disk the app
+ * extended, then powers off. The app rewrites the seed beforehand, so the
+ * next boot sets up the new login — no re-download.
+ */
+private const val CLEAN_CMD =
+    "sudo cloud-init clean --logs && sudo rm -f /etc/cloud/cloud-init.disabled" +
+        " && sudo resize2fs /dev/vda && sudo poweroff"
 
 /** A fully-installed VM's boot files: Start boots this instead of the serial guest. */
 data class BootSpec(    val kernel: String,
@@ -208,7 +231,7 @@ private fun App(
                 .navigationBarsPadding()
                 .imePadding(),
         ) {
-            HomeScreen(engine, displayAtBoot, libsReady, engineVer, loadError,
+            HomeScreen(engine, installer, displayAtBoot, libsReady, engineVer, loadError,
                 controlsVisible, { controlsVisible = it })
         }
         return
@@ -257,7 +280,7 @@ private fun App(
                 },
                 engineVer = engineVer,
             )
-            Tab.Home -> HomeScreen(engine, displayAtBoot, libsReady, engineVer, loadError,
+            Tab.Home -> HomeScreen(engine, installer, displayAtBoot, libsReady, engineVer, loadError,
                 controlsVisible, { controlsVisible = it })
         }
     }
@@ -274,6 +297,7 @@ private val bootLock = Any()
 @Composable
 private fun HomeScreen(
     engine: Engine,
+    installer: Installer,
     displayAtBoot: Boolean,
     libsReady: Boolean,
     engineVer: String,
@@ -285,9 +309,27 @@ private fun HomeScreen(
     // Reloaded every visit: Home recomposes fresh whenever the tab is
     // selected, so a just-installed OS shows up after Install's OK jump.
     var machines by remember { mutableStateOf(Installer.machines(context.applicationContext)) }
+    fun refreshMachines() {
+        // Sweep cancelled/failed installs (dirs without machine.json) — but
+        // never mid-install, whose dir is legitimately bare until it lands.
+        if (!installer.busy) {
+            try {
+                Installer.cleanStrays(context.applicationContext)
+            } catch (_: Exception) {
+            }
+        }
+        machines = Installer.machines(context.applicationContext)
+    }
     var bootError by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var bootedName by remember { mutableStateOf<String?>(null) }
+    // Manage (reset RAM/disk/account) + delete state. Blocked while a VM
+    // runs — one machine per process, and the disk/seed can't change under it.
+    var managing by remember { mutableStateOf<Machine?>(null) }
+    var pendingDelete by remember { mutableStateOf<Machine?>(null) }
+    var manageBusy by remember { mutableStateOf(false) }
+    // Result of the last no-download reset prepare, shown in the Manage card.
+    var resetInfo by remember { mutableStateOf<String?>(null) }
     var input by remember { mutableStateOf("") }
     var showSerialInput by remember { mutableStateOf(false) }
     var showConsole by remember { mutableStateOf(false) }
@@ -302,10 +344,11 @@ private fun HomeScreen(
     val runningDisplay = displayAtBoot && engine.isLive
 
     /** Boot a VM immediately on its own thread (create is slow). */
-    fun boot(name: String, spec: BootSpec) {
+    fun boot(machine: Machine, spec: BootSpec) {
         busy = true
         bootError = null
-        bootedName = name
+        bootedName = machine.name
+        val name = machine.name
         val appContext = context.applicationContext
         CrashLog.log(appContext, "boot", "booting $name (display=$displayAtBoot)")
         // A display boot lands in fullscreen: hide status + buttons.
@@ -369,6 +412,90 @@ private fun HomeScreen(
         }, "vm-kill").start()
         // Back to the full-chrome idle screen.
         onControlsVisible(true)
+    }
+
+    /** Delete a VM's files, then refresh the list. */
+    fun deleteMachine(machine: Machine) {
+        manageBusy = true
+        val appContext = context.applicationContext
+        CrashLog.log(appContext, "boot", "deleting ${machine.name}")
+        Thread({
+            val ok = Installer.deleteMachine(appContext, machine.id)
+            if (!ok) {
+                CrashLog.log(appContext, "boot", "delete ${machine.name} failed")
+            }
+            pendingDelete = null
+            if (managing?.id == machine.id) managing = null
+            refreshMachines()
+            manageBusy = false
+        }, "vm-delete").start()
+    }
+
+    /** RAM applies instantly to machine.json — the guest reads it at boot. */
+    fun applyMemory(machine: Machine, memoryGB: Int) {
+        val appContext = context.applicationContext
+        try {
+            Installer.saveMachine(appContext, machine.copy(memoryGB = memoryGB))
+            refreshMachines()
+            CrashLog.log(appContext, "boot", "${machine.name} memory → ${memoryGB}G")
+        } catch (e: Exception) {
+            CrashLog.log(appContext, "boot", "memory save failed: ${e.message}", e)
+        }
+    }
+
+    /**
+     * No-download reset: extend the disk in place, rewrite the seed with the
+     * new login + a fresh instance-id, save machine.json. The guest still
+     * needs its one clean command (CLEAN_CMD) before it re-runs setup —
+     * resetInfo tells the user exactly that.
+     */
+    fun prepareReset(
+        machine: Machine,
+        memoryGB: Int,
+        diskGB: Int,
+        user: String,
+        password: String,
+        hostname: String,
+    ) {
+        resetInfo = null
+        manageBusy = true
+        val appContext = context.applicationContext
+        CrashLog.log(appContext, "boot",
+            "preparing reset ${machine.name} (${memoryGB}G/${diskGB}G user=$user)")
+        Thread({
+            synchronized(bootLock) {
+            try {
+                val dir = File(Installer.vmsRoot(appContext), machine.id)
+                val growErr = Installer.growDisk(
+                    File(dir, "disk.img").absolutePath, machine.diskGB, diskGB)
+                if (growErr != null) throw RuntimeException("disk: $growErr")
+                var vendor = ""
+                try {
+                    vendor = fetchCatalog().firstOrNull { it.id == machine.imageId }
+                        ?.vendorData ?: ""
+                } catch (_: Exception) {
+                }
+                val seedErr = Installer.reseed(
+                    File(dir, "seed.img").absolutePath,
+                    user, password, hostname, vendor)
+                if (seedErr != null) throw RuntimeException("account: $seedErr")
+                Installer.saveMachine(appContext, machine.copy(
+                    memoryGB = memoryGB,
+                    diskGB = diskGB,
+                ))
+                refreshMachines()
+                resetInfo = "Ready. Boot ${machine.name}, log in as the OLD user," +
+                    " run the clean command, enter its password, wait for poweroff," +
+                    " Kill, then boot again into $user."
+                CrashLog.log(appContext, "boot", "${machine.name} reset prepared")
+            } catch (e: Exception) {
+                CrashLog.log(appContext, "boot", "reset prepare failed: ${e.message}", e)
+                resetInfo = "prepare failed: ${e.message}"
+            } finally {
+                manageBusy = false
+            }
+            }
+        }, "vm-reset").start()
     }
 
     LaunchedEffect(engine.consoleText, showConsole) {
@@ -444,30 +571,91 @@ private fun HomeScreen(
                                 Text("${m.desktop} • ${m.memoryGB}G RAM / ${m.diskGB}G disk")
                             },
                             trailingContent = {
-                                TipIconButton(
-                                    icon = Icons.Filled.PlayArrow,
-                                    tip = "Boot ${m.name}",
-                                    onClick = {
-                                        val dir = File(
-                                            Installer.vmsRoot(context.applicationContext), m.id)
-                                        boot(
-                                            m.name,
-                                            BootSpec(
-                                                kernel = File(dir, "vmlinuz").absolutePath,
-                                                initrd = File(dir, "initrd.img").absolutePath,
-                                                cmdline = m.cmdline,
-                                                disk = File(dir, "disk.img").absolutePath,
-                                                seed = File(dir, "seed.img").absolutePath,
-                                                cpus = m.cpus,
-                                                memoryMiB = m.memoryGB.toLong() * 1024,
-                                            ),
-                                        )
-                                    },
-                                    enabled = libsReady && !busy && !engine.isLive,
-                                    filled = true,
-                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    TipIconButton(
+                                        icon = Icons.Filled.PlayArrow,
+                                        tip = "Boot ${m.name}",
+                                        onClick = {
+                                            val dir = File(
+                                                Installer.vmsRoot(context.applicationContext), m.id)
+                                            boot(
+                                                m,
+                                                BootSpec(
+                                                    kernel = File(dir, "vmlinuz").absolutePath,
+                                                    initrd = File(dir, "initrd.img").absolutePath,
+                                                    cmdline = m.cmdline,
+                                                    disk = File(dir, "disk.img").absolutePath,
+                                                    seed = File(dir, "seed.img").absolutePath,
+                                                    cpus = m.cpus,
+                                                    memoryMiB = m.memoryGB.toLong() * 1024,
+                                                ),
+                                            )
+                                        },
+                                        enabled = libsReady && !busy && !engine.isLive && !manageBusy,
+                                        filled = true,
+                                    )
+                                    TipIconButton(
+                                        icon = Icons.Filled.Edit,
+                                        tip = "Manage ${m.name} — RAM, reinstall",
+                                        onClick = {
+                                            pendingDelete = null
+                                            resetInfo = null
+                                            managing = m
+                                        },
+                                        enabled = !busy && !manageBusy && !installer.busy,
+                                    )
+                                    TipIconButton(
+                                        icon = Icons.Filled.Delete,
+                                        tip = "Delete ${m.name}",
+                                        onClick = { managing = null; pendingDelete = m },
+                                        enabled = !busy && !manageBusy,
+                                    )
+                                }
                             },
                         )
+                        if (pendingDelete?.id == m.id) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "Delete ${m.name} and its disk? This can't be undone.",
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TipIconButton(
+                                    icon = Icons.Filled.Check,
+                                    tip = "Confirm delete",
+                                    onClick = { deleteMachine(m) },
+                                    enabled = !manageBusy,
+                                )
+                                TipIconButton(
+                                    icon = Icons.Filled.Close,
+                                    tip = "Keep ${m.name}",
+                                    onClick = { pendingDelete = null },
+                                    enabled = !manageBusy,
+                                )
+                            }
+                        }
+                        if (managing?.id == m.id) {
+                            val current = machines.firstOrNull { it.id == m.id } ?: m
+                            ManageMachineCard(
+                                machine = current,
+                                installer = installer,
+                                working = manageBusy,
+                                resetInfo = resetInfo,
+                                onApplyMemory = { gb -> applyMemory(current, gb) },
+                                onPrepare = { mem, disk, u, p, h ->
+                                    prepareReset(current, mem, disk, u, p, h)
+                                },
+                                onDone = {
+                                    managing = null
+                                    resetInfo = null
+                                    refreshMachines()
+                                },
+                                onCancel = { managing = null; resetInfo = null },
+                            )
+                        }
                     }
                 }
             }
@@ -548,12 +736,234 @@ private fun HomeScreen(
                 enabled = libsReady && engine.isLive,
             )
             TipIconButton(
+                icon = Icons.Filled.Build,
+                tip = "Paste guest clean command",
+                onClick = {
+                    input = CLEAN_CMD
+                    showConsole = true
+                    showSerialInput = true
+                },
+                enabled = libsReady && engine.isLive,
+            )
+            TipIconButton(
                 icon = Icons.Filled.Stop,
                 tip = "Kill",
                 onClick = { kill() },
                 enabled = libsReady && engine.isLive,
             )
         }
+    }
+}
+
+/**
+ * Manage one VM. Memory applies instantly (next boot reads machine.json).
+ * Disk size + login can reset without re-downloading: Prepare extends the
+ * disk and rewrites the seed in place, then one guest command (CLEAN_CMD,
+ * pasted from the action bar) makes the next boot a cloud-init first boot
+ * again — needed because the images switch cloud-init off after their first
+ * boot, so a re-seed alone never takes effect. Erase & reinstall is the
+ * fallback that downloads the image again into the same entry (the old
+ * files are kept as a backup until the new disk verifies, then removed),
+ * for when the current login is lost.
+ */
+@Composable
+private fun ManageMachineCard(
+    machine: Machine,
+    installer: Installer,
+    working: Boolean,
+    resetInfo: String?,
+    onApplyMemory: (Int) -> Unit,
+    onPrepare: (memoryGB: Int, diskGB: Int, user: String, password: String, hostname: String) -> Unit,
+    onDone: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    var memoryGB by remember(machine.id) { mutableStateOf(machine.memoryGB) }
+    var diskGB by remember(machine.id) { mutableStateOf(machine.diskGB.coerceAtLeast(12)) }
+    var user by remember(machine.id) { mutableStateOf("owner") }
+    var password by remember(machine.id) { mutableStateOf("") }
+    var hostname by remember(machine.id) { mutableStateOf("crate") }
+    var armed by remember(machine.id) { mutableStateOf(false) }
+    var catalogImg by remember(machine.id) { mutableStateOf<CatalogImage?>(null) }
+    var catalogError by remember(machine.id) { mutableStateOf<String?>(null) }
+    val busy = installer.busy || working
+    val phase = installer.phase
+
+    LaunchedEffect(machine.id) {
+        Thread({
+            try {
+                catalogImg = fetchCatalog().firstOrNull { it.id == machine.imageId }
+                    ?: throw RuntimeException("image ${machine.imageId} not in catalog")
+            } catch (e: Exception) {
+                catalogError = e.message
+            }
+        }, "catalog-fetch").start()
+    }
+
+    // A finished reinstall lands here (shared installer phase): close up.
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Memory — applies now, guest reads it at boot", fontSize = 12.sp)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            for (gb in (listOf(2, 4, 6, 8) + machine.memoryGB).distinct().sorted()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TipIconButton(
+                        icon = if (gb == memoryGB) Icons.Filled.RadioButtonChecked
+                            else Icons.Filled.RadioButtonUnchecked,
+                        tip = "$gb GB RAM",
+                        onClick = { memoryGB = gb },
+                        enabled = !busy,
+                    )
+                    Text("${gb}G", fontSize = 12.sp)
+                }
+            }
+            TipIconButton(
+                icon = Icons.Filled.Check,
+                tip = "Apply memory",
+                onClick = { onApplyMemory(memoryGB) },
+                enabled = !busy && memoryGB != machine.memoryGB,
+                filled = true,
+            )
+        }
+        Text("Reset without re-download — new size + login, one guest command",
+            fontSize = 12.sp)
+        Text(
+            "Prepare rewrites the disk + seed in place; the guest still needs " +
+                "its clean command once (needs the CURRENT password — if that login " +
+                "is lost, use Erase & reinstall below).",
+            fontSize = 12.sp,
+        )
+        resetInfo?.let {
+            Text(it, fontSize = 13.sp)
+        }
+        Text(
+            CLEAN_CMD,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            TipIconButton(
+                icon = Icons.Filled.Build,
+                tip = "Prepare no-download reset",
+                onClick = { onPrepare(memoryGB, diskGB, user, password, hostname) },
+                enabled = !busy && user.isNotBlank() && password.isNotEmpty() &&
+                    hostname.isNotBlank(),
+                filled = true,
+            )
+        }
+        Text("Fresh disk + login — erases everything, re-downloads",
+            fontSize = 12.sp)
+        if (catalogError != null && catalogImg == null) {
+            Text("catalog: $catalogError", fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.error)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            for (gb in listOf(12, 16, 24, 32, 48, 64)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TipIconButton(
+                        icon = if (gb == diskGB) Icons.Filled.RadioButtonChecked
+                            else Icons.Filled.RadioButtonUnchecked,
+                        tip = "$gb GB disk",
+                        onClick = { diskGB = gb },
+                        enabled = !busy,
+                    )
+                    Text("${gb}G", fontSize = 12.sp)
+                }
+            }
+        }
+        TextField(value = user, onValueChange = { user = it },
+            label = { Text("new user") }, singleLine = true, enabled = !busy)
+        TextField(value = password, onValueChange = { password = it },
+            label = { Text("new password") }, singleLine = true,
+            visualTransformation = PasswordVisualTransformation(), enabled = !busy)
+        TextField(value = hostname, onValueChange = { hostname = it },
+            label = { Text("hostname") }, singleLine = true, enabled = !busy)
+        when (val p = phase) {
+            is Installer.Phase.Downloading ->
+                Text("reinstalling ${p.done shr 20}/${p.total shr 20} MiB",
+                    fontSize = 13.sp)
+            is Installer.Phase.Unpacking ->
+                Text("unpacking ${p.done shr 20}/${p.total shr 20} MiB",
+                    fontSize = 13.sp)
+            is Installer.Phase.Finishing -> Text("verifying + seeding…", fontSize = 13.sp)
+            is Installer.Phase.Done ->
+                if (armed) {
+                    Text("reinstalled ${p.machine.name} — tap OK",
+                        fontSize = 13.sp)
+                }
+            is Installer.Phase.Failed ->
+                if (armed) {
+                    Text("reinstall failed: ${p.message}. The old VM was kept.",
+                        fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
+                }
+            is Installer.Phase.Idle -> {}
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (phase is Installer.Phase.Done && armed) {
+                TipIconButton(
+                    icon = Icons.Filled.Check,
+                    tip = "OK",
+                    onClick = {
+                        armed = false
+                        installer.reset()
+                        onDone()
+                    },
+                )
+            } else if (phase is Installer.Phase.Failed && armed) {
+                TipIconButton(
+                    icon = Icons.Filled.Check,
+                    tip = "OK",
+                    onClick = {
+                        armed = false
+                        installer.reset()
+                    },
+                )
+            } else if (!armed) {
+                TipIconButton(
+                    icon = Icons.Filled.Refresh,
+                    tip = "Erase & reinstall",
+                    onClick = { armed = true },
+                    enabled = !busy && catalogImg != null && user.isNotBlank() &&
+                        password.isNotEmpty() && hostname.isNotBlank(),
+                    filled = true,
+                )
+            } else {
+                Text(
+                    "Erase everything and reinstall ${diskGB}G as $user? The new disk re-downloads (~${(catalogImg?.downloadBytes ?: 0) shr 20} MiB).",
+                    fontSize = 13.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                TipIconButton(
+                    icon = Icons.Filled.Check,
+                    tip = "Confirm reinstall",
+                    onClick = {
+                        val img = catalogImg ?: return@TipIconButton
+                        installer.reinstall(machine, img, memoryGB, diskGB,
+                            user, password, hostname)
+                    },
+                    enabled = !busy,
+                )
+                TipIconButton(
+                    icon = Icons.Filled.Close,
+                    tip = "Keep ${machine.name}",
+                    onClick = { armed = false },
+                    enabled = !busy,
+                )
+            }
+            TipIconButton(
+                icon = Icons.Filled.Close,
+                tip = "Close",
+                onClick = {
+                    if (!busy) {
+                        armed = false
+                        onCancel()
+                    }
+                },
+                enabled = !busy,
+            )
+        }
+        if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
     }
 }
 
@@ -570,6 +980,39 @@ private fun sendTablet(engine: Engine, gx: Int, gy: Int, guestW: Int, guestH: In
     engine.sendPointer((nx * 32767f).toInt(), (ny * 32767f).toInt(), buttons)
 }
 
+/**
+ * ContentScale.Fit centers the guest rect inside the view with bars wherever
+ * the aspects differ (fullscreen: the phone is ~19.5:9 against the guest's
+ * 8:5, so bars left/right + top/bottom). Mapping the whole view naively
+ * makes the edges unreachable — the cursor sticks before corners like the
+ * top-left. Returns (scale, offsetX, offsetY): view px → (px - offset)/scale.
+ */
+private fun fitTransform(
+    vw: Int,
+    vh: Int,
+    gw: Int,
+    gh: Int,
+): Triple<Float, Float, Float> {
+    if (vw <= 0 || vh <= 0 || gw <= 0 || gh <= 0) return Triple(1f, 0f, 0f)
+    val s = minOf(vw / gw.toFloat(), vh / gh.toFloat()).takeIf { it > 0f } ?: 1f
+    return Triple(s, (vw - gw * s) / 2f, (vh - gh * s) / 2f)
+}
+
+/** View px → guest px through the Fit transform, clamped to the guest. */
+private fun viewToGuest(
+    vw: Int,
+    vh: Int,
+    gw: Int,
+    gh: Int,
+    x: Float,
+    y: Float,
+): Pair<Int, Int> {
+    val (s, ox, oy) = fitTransform(vw, vh, gw, gh)
+    val gx = ((x - ox) / s).toInt().coerceIn(0, (gw - 1).coerceAtLeast(0))
+    val gy = ((y - oy) / s).toInt().coerceIn(0, (gh - 1).coerceAtLeast(0))
+    return gx to gy
+}
+
 private fun guestTouch(
     engine: Engine,
     viewSize: IntSize,
@@ -580,8 +1023,7 @@ private fun guestTouch(
     val w = viewSize.width
     val h = viewSize.height
     if (w <= 0 || h <= 0) return false
-    val x = ((event.x / w) * guestW).toInt().coerceIn(0, (guestW - 1).coerceAtLeast(0))
-    val y = ((event.y / h) * guestH).toInt().coerceIn(0, (guestH - 1).coerceAtLeast(0))
+    val (x, y) = viewToGuest(w, h, guestW, guestH, event.x, event.y)
     when (event.action) {
         android.view.MotionEvent.ACTION_DOWN,
         android.view.MotionEvent.ACTION_MOVE,
@@ -708,8 +1150,7 @@ private fun mouseTouch(
         if (dx != 0 || dy != 0) engine.sendScroll(dx, dy)
         return true
     }
-    val x = ((event.x / w) * guestW).toInt().coerceIn(0, (guestW - 1).coerceAtLeast(0))
-    val y = ((event.y / h) * guestH).toInt().coerceIn(0, (guestH - 1).coerceAtLeast(0))
+    val (x, y) = viewToGuest(w, h, guestW, guestH, event.x, event.y)
     when (event.actionMasked) {
         android.view.MotionEvent.ACTION_HOVER_ENTER,
         android.view.MotionEvent.ACTION_HOVER_MOVE,
@@ -751,8 +1192,11 @@ private fun padEvent(
     if (w <= 0 || h <= 0) return true
     val maxX = (guestW - 1).coerceAtLeast(0)
     val maxY = (guestH - 1).coerceAtLeast(0)
-    val sx = guestW / w.toFloat() * PAD_GAIN
-    val sy = guestH / h.toFloat() * PAD_GAIN
+    // Touchpad deltas ride the same Fit scale as absolute touches, so a
+    // swipe covers the same ground in fullscreen as in the card.
+    val s = fitTransform(w, h, guestW, guestH).first
+    val sx = PAD_GAIN / s
+    val sy = PAD_GAIN / s
     fun send() {
         sendTablet(
             engine,
@@ -872,7 +1316,14 @@ private fun GuestImage(
     // can't be detected in the event stream alone — a timer fires it.
     val holdTimer = remember { Handler(Looper.getMainLooper()) }
     fun handleTouch(viewW: IntSize, gw: Int, gh: Int, event: android.view.MotionEvent): Boolean {
-        focusRequester.requestFocus()
+        // Focus only on real presses — hover moves flood at 120Hz+ and a
+        // focus request per event stalls the gesture stream the cursor
+        // rides on.
+        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN ||
+            event.actionMasked == android.view.MotionEvent.ACTION_HOVER_ENTER
+        ) {
+            focusRequester.requestFocus()
+        }
         // A connected mouse drives the tablet directly even with the
         // touchpad toggle on — its position is already absolute.
         if (mouseActive || isMouseEvent(event)) {

@@ -40,6 +40,73 @@ class Installer(private val context: Context) {
 
         fun vmsRoot(context: Context): File = File(context.filesDir, "VMs")
 
+        /** Removes the VM's whole folder (disk, seed, kernel, machine.json). */
+        fun deleteMachine(context: Context, id: String): Boolean = try {
+            File(vmsRoot(context), id).deleteRecursively()
+        } catch (_: Exception) {
+            false
+        }
+
+        fun saveMachine(context: Context, machine: Machine) {
+            machine.write(File(File(vmsRoot(context), machine.id), "machine.json"))
+        }
+
+        /**
+         * Deletes install leftovers: VM dirs that never got a machine.json
+         * (a cancelled/failed install). Never call while an install or
+         * reinstall runs — its dir has no machine.json until it finishes.
+         */
+        fun cleanStrays(context: Context) {
+            vmsRoot(context).listFiles()
+                ?.filter { it.isDirectory && !File(it, "machine.json").exists() }
+                ?.forEach { try { it.deleteRecursively() } catch (_: Exception) { } }
+        }
+
+        /**
+         * Grows the disk to [newDiskGB] when larger than [currentDiskGB].
+         * Shrinking is not supported (the guest filesystem can't be safely
+         * shrunk in place), so a smaller size is a no-op. Returns an error
+         * message or null on success. The guest must run `resize2fs /dev/vda`
+         * itself afterwards — cloud-init only grows the filesystem on a
+         * first boot.
+         */
+        fun growDisk(diskPath: String, currentDiskGB: Int, newDiskGB: Int): String? {
+            if (newDiskGB <= currentDiskGB) return null
+            return if (nativeExtend(diskPath, newDiskGB.toLong() shl 30) != 0) {
+                nativeLastError()
+            } else {
+                null
+            }
+        }
+
+        /**
+         * Rewrites seed.img with a new account + hostname and a fresh
+         * instance-id. Takes effect only on a cloud-init first boot — the
+         * images switch cloud-init off after theirs, so pair this with the
+         * guest clean command (see CLEAN_CMD) or a fresh disk. Returns an
+         * error message or null on success.
+         */
+        fun reseed(
+            seedPath: String,
+            user: String,
+            password: String,
+            hostname: String,
+            vendorTemplate: String,
+        ): String? {
+            val tz = try {
+                java.util.TimeZone.getDefault().id
+            } catch (_: Exception) {
+                "UTC"
+            }
+            val instance = UUID.randomUUID().toString()
+            return if (nativeSeed(seedPath, user, password, hostname, tz,
+                    vendorTemplate, instance) != 0) {
+                nativeLastError()
+            } else {
+                null
+            }
+        }
+
         fun machines(context: Context): List<Machine> =
             vmsRoot(context).listFiles()
                 ?.mapNotNull { dir ->
@@ -118,6 +185,85 @@ class Installer(private val context: Context) {
         if (Thread.currentThread().isInterrupted) throw InterruptedException()
     }
 
+    /**
+     * Erases a VM back to a fresh disk and installs it again with new
+     * settings, in the same folder (same Home entry). A re-seed alone can't
+     * switch users: the images turn cloud-init off after the first boot
+     * (cloud-init.disabled), so only a fresh disk boots into setup again.
+     * The old files are kept as a backup until the new install verifies,
+     * then removed; on failure the backup is restored and the VM boots as
+     * before. Needs the catalog image (kernel/disk URLs) — pass the entry
+     * matching [machine]'s imageId.
+     */
+    fun reinstall(
+        machine: Machine,
+        image: CatalogImage,
+        memoryGB: Int,
+        diskGB: Int,
+        user: String,
+        password: String,
+        hostname: String,
+    ) {
+        if (busy) return
+        busy = true
+        phase = Phase.Downloading(0, image.downloadBytes)
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "crate:install")
+        wake.acquire(30 * 60 * 1000L)
+        val w = Thread({
+            val dir = File(vmsRoot(context), machine.id)
+            val bak = File(vmsRoot(context), machine.id + ".bak")
+            try {
+                try {
+                    bak.deleteRecursively()
+                } catch (_: Exception) {
+                }
+                bak.mkdirs()
+                for (name in listOf("vmlinuz", "initrd.img", "disk.img", "seed.img", "machine.json")) {
+                    val f = File(dir, name)
+                    if (f.exists() && !f.renameTo(File(bak, name))) {
+                        throw RuntimeException("can't back up $name")
+                    }
+                }
+                try {
+                    val done = runInto(dir, machine.id, image, memoryGB, diskGB,
+                        user, password, hostname)
+                    try {
+                        bak.deleteRecursively()
+                    } catch (_: Exception) {
+                    }
+                    phase = Phase.Done(done)
+                } catch (e: Exception) {
+                    // Put the old VM back so it still boots.
+                    for (name in listOf("vmlinuz", "initrd.img", "disk.img", "seed.img", "machine.json")) {
+                        try {
+                            File(dir, name).delete()
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            File(bak, name).renameTo(File(dir, name))
+                        } catch (_: Exception) {
+                        }
+                    }
+                    throw e
+                }
+            } catch (e: InterruptedException) {
+                phase = Phase.Idle
+            } catch (e: Exception) {
+                phase = Phase.Failed(e.message ?: e.toString())
+            } finally {
+                busy = false
+                worker = null
+                try {
+                    wake.release()
+                } catch (_: Exception) {
+                }
+            }
+        }, "vm-reinstall")
+        worker = w
+        w.start()
+    }
+
     private var downloaded: Long = 0
 
     private fun fetch(file: CatalogFile, to: File, progressTotal: Long) {
@@ -179,6 +325,26 @@ class Installer(private val context: Context) {
     ): Machine {
         val id = UUID.randomUUID()
         val dir = File(vmsRoot(context), id.toString())
+        try {
+            return runInto(dir, id.toString(), image, memoryGB, diskGB,
+                user, password, hostname)
+        } catch (e: Exception) {
+            dir.deleteRecursively()
+            throw e
+        }
+    }
+
+    /** Downloads + unpacks + seeds into [dir]; the caller owns cleanup. */
+    private fun runInto(
+        dir: File,
+        id: String,
+        image: CatalogImage,
+        memoryGB: Int,
+        diskGB: Int,
+        user: String,
+        password: String,
+        hostname: String,
+    ): Machine {
         dir.mkdirs()
         val kernel = File(dir, "vmlinuz")
         val initrd = File(dir, "initrd.img")
@@ -238,8 +404,11 @@ class Installer(private val context: Context) {
             )
             machine.write(File(dir, "machine.json"))
             return machine
+        } catch (e: InterruptedException) {
+            throw e
         } catch (e: Exception) {
-            dir.deleteRecursively()
+            // Caller owns cleanup: fresh installs delete the dir, reinstalls
+            // restore the backup.
             throw e
         }
     }
