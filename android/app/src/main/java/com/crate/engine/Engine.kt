@@ -27,6 +27,15 @@ class Engine {
 
         @JvmStatic
         external fun nativeLastError(): String
+
+        /**
+         * Process-wide VM owner. The native registry holds one machine per
+         * process, so every activity instance must share one Engine: a fresh
+         * Engine per activity would see isLive=false while the old machine
+         * still exists, and create() would fail with "one machine per
+         * process: destroy the old one first".
+         */
+        val shared: Engine by lazy { Engine() }
     }
 
     var id: Long = 0

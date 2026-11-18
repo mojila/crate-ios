@@ -1,24 +1,29 @@
 package com.crate.app
 
 import android.app.Activity
+import android.content.Context
 import android.content.pm.ActivityInfo
+import android.hardware.input.InputManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.InputDevice
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.imePadding
@@ -38,6 +43,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mouse
@@ -53,6 +60,7 @@ import com.crate.app.ui.TipIconButton
 import com.crate.app.ui.theme.CrateTheme
 import com.crate.app.ui.theme.ThemeMode
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,6 +68,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.key.KeyEventType
@@ -78,6 +87,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.crate.engine.Engine
 import com.crate.engine.EngineException
+import com.crate.engine.GuestDns
 import com.crate.engine.LinuxKeys
 import com.crate.engine.NativeLibs
 import com.crate.install.InstallPanel
@@ -107,7 +117,10 @@ data class BootSpec(    val kernel: String,
  * (filesDir/VMs/<id>/); Boot hands their files back here as a [BootSpec].
  */
 class MainActivity : ComponentActivity() {
-    private val engine = Engine()
+    // Process-wide: see Engine.shared. Never destroy here — a second
+    // activity instance (launcher tap) shares the live machine, and
+    // destroying in onDestroy would kill a running guest under it.
+    private val engine: Engine get() = Engine.shared
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -123,7 +136,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        engine.destroy()
+        // No engine.destroy(): the machine outlives any one activity
+        // instance; Kill frees it explicitly. Process death reclaims it.
         super.onDestroy()
     }
 }
@@ -140,6 +154,9 @@ private fun App(
     var loadError by remember { mutableStateOf<String?>(null) }
     var tab by remember { mutableStateOf(Tab.Home) }
     var displayAtBoot by remember { mutableStateOf(VmPrefs.loadDisplayAtBoot(context)) }
+    // Controls (status, buttons, menus) hide while a display VM runs — the
+    // guest goes edge-to-edge by default, one tap brings chrome back.
+    var controlsVisible by remember { mutableStateOf(true) }
     val installer = remember { Installer(context.applicationContext) }
 
     // Load natives once, off the main thread.
@@ -177,6 +194,22 @@ private fun App(
                 ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             activity.window.insetsController?.show(WindowInsets.Type.statusBars())
         }
+    }
+
+    // Fullscreen guest: no menu row, no padding chrome — the display owns
+    // the window, with its own floating show-controls button. Serial/idle
+    // keep the normal menu + screen below.
+    if (tab == Tab.Home && booted && !controlsVisible) {
+        Box(
+            modifier = Modifier.fillMaxSize()
+                .background(Color.Black)
+                .navigationBarsPadding()
+                .imePadding(),
+        ) {
+            HomeScreen(engine, displayAtBoot, libsReady, engineVer, loadError,
+                controlsVisible, { controlsVisible = it })
+        }
+        return
     }
 
     Column(
@@ -222,10 +255,19 @@ private fun App(
                 },
                 engineVer = engineVer,
             )
-            Tab.Home -> HomeScreen(engine, displayAtBoot, libsReady, engineVer, loadError)
+            Tab.Home -> HomeScreen(engine, displayAtBoot, libsReady, engineVer, loadError,
+                controlsVisible, { controlsVisible = it })
         }
     }
 }
+
+/**
+ * Process-wide boot serialization. HomeScreen is rebuilt on every tab visit,
+ * so its `busy` flag can't stop a stale screen from booting twice over one
+ * slow create: the two machines would collide ("one machine per process")
+ * and orphan one forever. Boot and kill serialize here instead.
+ */
+private val bootLock = Any()
 
 @Composable
 private fun HomeScreen(
@@ -234,6 +276,8 @@ private fun HomeScreen(
     libsReady: Boolean,
     engineVer: String,
     loadError: String?,
+    controlsVisible: Boolean,
+    onControlsVisible: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     // Reloaded every visit: Home recomposes fresh whenever the tab is
@@ -245,16 +289,27 @@ private fun HomeScreen(
     var input by remember { mutableStateOf("") }
     var showSerialInput by remember { mutableStateOf(false) }
     var showConsole by remember { mutableStateOf(false) }
+    // Touchpad (relative) is the default; direct tablet stays one tap away.
+    // Hoisted here so fullscreen and card modes share the same pointer mode.
+    // A connected mouse forces direct mode (its position is already
+    // absolute) and disables the toggle until it disconnects.
+    var touchpad by remember { mutableStateOf(true) }
+    val hasMouse = rememberHasPhysicalMouse()
     val scroll = rememberScrollState()
     val focus = LocalFocusManager.current
+    val runningDisplay = displayAtBoot && engine.isLive
 
     /** Boot a VM immediately on its own thread (create is slow). */
     fun boot(name: String, spec: BootSpec) {
         busy = true
         bootError = null
         bootedName = name
+        // A display boot lands in fullscreen: hide status + buttons.
+        if (displayAtBoot) onControlsVisible(false)
         Thread({
+            synchronized(bootLock) {
             try {
+                GuestDns.ensure(context.applicationContext)
                 if (engine.isLive) engine.destroy()
                 engine.create(
                     kernel = spec.kernel,
@@ -279,12 +334,14 @@ private fun HomeScreen(
             } finally {
                 busy = false
             }
+            }
         }, "vm-boot").start()
     }
 
     /** Kill the machine, then free it so another OS can boot. */
     fun kill() {
         Thread({
+            synchronized(bootLock) {
             try {
                 engine.kill()
             } finally {
@@ -296,11 +353,39 @@ private fun HomeScreen(
                 engine.destroy()
                 bootedName = null
             }
+            }
         }, "vm-kill").start()
+        // Back to the full-chrome idle screen.
+        onControlsVisible(true)
     }
 
-    LaunchedEffect(engine.consoleText) {
-        scroll.scrollTo(scroll.maxValue)
+    LaunchedEffect(engine.consoleText, showConsole) {
+        // Only yank the scroll while the console is actually shown — otherwise
+        // every kernel log line during boot would hide the display card
+        // behind the status header.
+        if (showConsole) scroll.scrollTo(scroll.maxValue)
+    }
+
+    // Fullscreen guest: just the display on black + a floating button to
+    // bring controls back. No status, no buttons, no cards.
+    if (runningDisplay && !controlsVisible) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Black),
+        ) {
+            GuestImage(
+                engine = engine,
+                touchpad = touchpad && !hasMouse,
+                mouseActive = hasMouse,
+                modifier = Modifier.fillMaxSize().align(Alignment.Center),
+            )
+            TipIconButton(
+                icon = Icons.Filled.FullscreenExit,
+                tip = "Show controls",
+                onClick = { onControlsVisible(true) },
+                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+            )
+        }
+        return
     }
 
     // Status up top, scrollable content in the middle, action bar pinned
@@ -366,7 +451,7 @@ private fun HomeScreen(
                                             ),
                                         )
                                     },
-                                    enabled = libsReady && !busy,
+                                    enabled = libsReady && !busy && !engine.isLive,
                                     filled = true,
                                 )
                             },
@@ -381,7 +466,7 @@ private fun HomeScreen(
             // so the key strip + action bar stay on screen with it.
             if (displayAtBoot && engine.isLive) {
                 SectionCard("Display") {
-                    DisplayPanel(engine)
+                    DisplayPanel(engine, touchpad, { touchpad = it }, hasMouse)
                 }
             }
 
@@ -425,6 +510,13 @@ private fun HomeScreen(
 
         HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (runningDisplay) {
+                TipIconButton(
+                    icon = Icons.Filled.Fullscreen,
+                    tip = "Hide controls — fullscreen",
+                    onClick = { onControlsVisible(false) },
+                )
+            }
             TipIconButton(
                 icon = Icons.Filled.Terminal,
                 tip = if (showSerialInput) "Hide serial input" else "Show serial input",
@@ -517,6 +609,111 @@ private class PadState {
 
 /** Touchpad gain: one full-width swipe crosses ~2 guest screens. */
 private const val PAD_GAIN = 2f
+
+/**
+ * True while a physical mouse (Bluetooth/USB/OTG) is attached. Mice
+ * register as an [InputDevice] with source MOUSE. That alone over-matches:
+ * this phone's built-in `sec_touchpad` also carries MOUSE (it is a touchpad,
+ * source TOUCHPAD), so touchpads, touchscreens, styli and virtual devices
+ * are excluded — only a genuine external pointer counts. Live-updated so
+ * pairing mid-session switches over.
+ */
+@Composable
+private fun rememberHasPhysicalMouse(): Boolean {
+    val context = LocalContext.current
+    var hasMouse by remember { mutableStateOf(false) }
+    DisposableEffect(Unit) {
+        val manager =
+            context.getSystemService(Context.INPUT_SERVICE) as InputManager
+        fun isPhysicalMouse(device: InputDevice): Boolean {
+            if (device.isVirtual) return false
+            if (!device.supportsSource(InputDevice.SOURCE_MOUSE)) return false
+            if (device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN)) return false
+            if (device.supportsSource(InputDevice.SOURCE_TOUCHPAD)) return false
+            if (device.supportsSource(InputDevice.SOURCE_STYLUS)) return false
+            return true
+        }
+        fun query(): Boolean = InputDevice.getDeviceIds().any { id ->
+            try {
+                val device = InputDevice.getDevice(id)
+                device != null && isPhysicalMouse(device)
+            } catch (_: Exception) {
+                false
+            }
+        }
+        val listener = object : InputManager.InputDeviceListener {
+            override fun onInputDeviceAdded(id: Int) { hasMouse = query() }
+            override fun onInputDeviceRemoved(id: Int) { hasMouse = query() }
+            override fun onInputDeviceChanged(id: Int) { hasMouse = query() }
+        }
+        hasMouse = query()
+        manager.registerInputDeviceListener(listener, null)
+        onDispose { manager.unregisterInputDeviceListener(listener) }
+    }
+    return hasMouse
+}
+
+/** Android button bits map 1:1 onto the guest's BUTTON_LEFT/RIGHT/MIDDLE. */
+private fun mouseButtons(state: Int): Int {
+    var buttons = 0
+    if (state and android.view.MotionEvent.BUTTON_PRIMARY != 0) buttons = buttons or 1
+    if (state and android.view.MotionEvent.BUTTON_SECONDARY != 0) buttons = buttons or 2
+    if (state and android.view.MotionEvent.BUTTON_TERTIARY != 0) buttons = buttons or 4
+    return buttons
+}
+
+private fun isMouseEvent(event: android.view.MotionEvent): Boolean {
+    try {
+        if (event.isFromSource(InputDevice.SOURCE_MOUSE)) return true
+    } catch (_: Exception) {
+    }
+    return try {
+        event.getToolType(0) == android.view.MotionEvent.TOOL_TYPE_MOUSE
+    } catch (_: Exception) {
+        false
+    }
+}
+
+/**
+ * Physical-mouse path: the mouse already reports an absolute position, so
+ * it drives the guest tablet directly — no touchpad accumulation. Hover
+ * moves the cursor (buttons 0), presses carry the real button bits, and
+ * the wheel scrolls. Returns true (event consumed).
+ */
+private fun mouseTouch(
+    engine: Engine,
+    viewSize: IntSize,
+    guestW: Int,
+    guestH: Int,
+    event: android.view.MotionEvent,
+): Boolean {
+    val w = viewSize.width
+    val h = viewSize.height
+    if (w <= 0 || h <= 0) return true
+    if (event.actionMasked == android.view.MotionEvent.ACTION_SCROLL) {
+        val dx = event.getAxisValue(android.view.MotionEvent.AXIS_HSCROLL).toInt()
+        val dy = event.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL).toInt()
+        if (dx != 0 || dy != 0) engine.sendScroll(dx, dy)
+        return true
+    }
+    val x = ((event.x / w) * guestW).toInt().coerceIn(0, (guestW - 1).coerceAtLeast(0))
+    val y = ((event.y / h) * guestH).toInt().coerceIn(0, (guestH - 1).coerceAtLeast(0))
+    when (event.actionMasked) {
+        android.view.MotionEvent.ACTION_HOVER_ENTER,
+        android.view.MotionEvent.ACTION_HOVER_MOVE,
+        android.view.MotionEvent.ACTION_HOVER_EXIT,
+        android.view.MotionEvent.ACTION_DOWN,
+        android.view.MotionEvent.ACTION_MOVE,
+        android.view.MotionEvent.ACTION_UP,
+        android.view.MotionEvent.ACTION_CANCEL,
+        android.view.MotionEvent.ACTION_BUTTON_PRESS,
+        android.view.MotionEvent.ACTION_BUTTON_RELEASE,
+        android.view.MotionEvent.ACTION_POINTER_DOWN,
+        android.view.MotionEvent.ACTION_POINTER_UP,
+        -> sendTablet(engine, x, y, guestW, guestH, mouseButtons(event.buttonState))
+    }
+    return true
+}
 
 private fun padEvent(
     engine: Engine,
@@ -624,18 +821,37 @@ private fun Engine.tapKey(code: Int) {    Thread({
 }
 
 /**
- * Phase-3 display panel: the guest screen scaled to fit, touches as the
- * tablet (tap clicks, drag holds the button — mirrors iOS DisplayView), a
- * key row for what the soft keyboard can't type, and hardware/BT keyboards
- * via [LinuxKeys].
+ * The touchable guest screen alone — no keys, no toggles. Both the card
+ * and fullscreen modes share it; chrome lives in [DisplayPanel].
  */
 @Composable
-private fun DisplayPanel(engine: Engine) {
+private fun GuestImage(
+    engine: Engine,
+    touchpad: Boolean,
+    modifier: Modifier = Modifier,
+    mouseActive: Boolean = false,
+) {
     val img = engine.frameImage
     var viewSize by remember { androidx.compose.runtime.mutableStateOf(IntSize.Zero) }
     val focusRequester = remember { FocusRequester() }
-    // Touchpad (relative) is the default; direct tablet stays one tap away.
-    var touchpad by remember { mutableStateOf(true) }
+    // A paired keyboard needs somewhere to send keys before the first
+    // tap: grab focus once the first frame lands. Keyed on the null
+    // transition so later frames never yank focus from the serial field.
+    var autofocused by remember { mutableStateOf(false) }
+    LaunchedEffect(engine.isLive) {
+        // A fresh boot gets a fresh grab; otherwise focus would sit on
+        // whatever was last tapped (e.g. Kill) across a reboot.
+        if (!engine.isLive) autofocused = false
+    }
+    LaunchedEffect(img != null) {
+        if (img != null && !autofocused) {
+            autofocused = true
+            try {
+                focusRequester.requestFocus()
+            } catch (_: Exception) {
+            }
+        }
+    }
     val pad = remember { PadState() }
     val viewConfig = LocalViewConfiguration.current
     val slop = viewConfig.touchSlop
@@ -645,6 +861,11 @@ private fun DisplayPanel(engine: Engine) {
     val holdTimer = remember { Handler(Looper.getMainLooper()) }
     fun handleTouch(viewW: IntSize, gw: Int, gh: Int, event: android.view.MotionEvent): Boolean {
         focusRequester.requestFocus()
+        // A connected mouse drives the tablet directly even with the
+        // touchpad toggle on — its position is already absolute.
+        if (mouseActive || isMouseEvent(event)) {
+            return mouseTouch(engine, viewW, gw, gh, event)
+        }
         return if (touchpad) {
             padEvent(engine, pad, viewW, gw, gh, slop, longPressMs,
                 onDown = {
@@ -673,22 +894,11 @@ private fun DisplayPanel(engine: Engine) {
     }
 
     if (img != null) {
-    // fillMaxWidth + aspectRatio keeps the 1280x800 guest proportional.
-    // wrapContentHeight alone collapsed to a sliver (unbounded scroll
-    // constraints give the image no height to resolve against).
-    val aspect = if (engine.frameWidth > 0 && engine.frameHeight > 0) {
-        engine.frameWidth.toFloat() / engine.frameHeight.toFloat()
-    } else {
-        16f / 10f
-    }
     Image(
         bitmap = img,
         contentDescription = "guest display",
         contentScale = ContentScale.Fit,
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(aspect)
-            .heightIn(max = 520.dp)
+        modifier = modifier
             .onSizeChanged { viewSize = it }
             .focusRequester(focusRequester)
             .focusable()
@@ -708,16 +918,48 @@ private fun DisplayPanel(engine: Engine) {
     )
     } else {
         Text(
-            if (touchpad) "(waiting for first frame — touchpad drives the guest cursor)"
+            if (mouseActive) "(waiting for first frame — mouse drives the guest cursor)"
+            else if (touchpad) "(waiting for first frame — touchpad drives the guest cursor)"
             else "(waiting for first frame — touch still reaches the guest tablet)",
             fontSize = 12.sp,
-            modifier = Modifier
-                .fillMaxWidth()
+            modifier = modifier
                 .onSizeChanged { viewSize = it }
                 .pointerInteropFilter { event ->
                     // No frame yet: fall back to the default 1024x768 mode.
                     handleTouch(viewSize, 1024, 768, event)
                 },
+        )
+    }
+}
+
+/**
+ * Phase-3 display panel: the guest screen scaled to fit, touches as the
+ * tablet (tap clicks, drag holds the button — mirrors iOS DisplayView), a
+ * key row for what the soft keyboard can't type, and hardware/BT keyboards
+ * via [LinuxKeys].
+ */
+@Composable
+private fun DisplayPanel(
+    engine: Engine,
+    touchpad: Boolean,
+    onTouchpad: (Boolean) -> Unit,
+    mouseActive: Boolean = false,
+) {
+    // Explicit size from the available width: aspectRatio never resolved a
+    // height inside the scrolling column (measured 2052x9 on device), so
+    // derive height = width / aspect here and hand GuestImage a fixed box.
+    val aspect = if (engine.frameWidth > 0 && engine.frameHeight > 0) {
+        engine.frameWidth.toFloat() / engine.frameHeight.toFloat()
+    } else {
+        16f / 10f
+    }
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val h = (maxWidth / aspect).coerceAtMost(520.dp).coerceAtLeast(120.dp)
+        GuestImage(
+            engine = engine,
+            touchpad = touchpad && !mouseActive,
+            mouseActive = mouseActive,
+            modifier = Modifier.fillMaxWidth().height(h),
         )
     }
 
@@ -747,11 +989,13 @@ private fun DisplayPanel(engine: Engine) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         TipIconButton(
-            icon = if (touchpad) Icons.Filled.Mouse else Icons.Filled.TouchApp,
-            tip = if (touchpad) "Touchpad on — tap for direct touch"
+            icon = if (touchpad && !mouseActive) Icons.Filled.Mouse else Icons.Filled.TouchApp,
+            tip = if (mouseActive) "Physical mouse connected — touchpad off"
+                else if (touchpad) "Touchpad on — tap for direct touch"
                 else "Direct touch — tap for touchpad",
-            onClick = { touchpad = !touchpad },
-            filled = touchpad,
+            onClick = { onTouchpad(!touchpad) },
+            enabled = !mouseActive,
+            filled = touchpad && !mouseActive,
         )
         Text("frames: ${engine.framesSeen}", fontSize = 12.sp)
     }

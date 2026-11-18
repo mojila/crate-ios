@@ -53,7 +53,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Home lists installed operating systems — tap **Boot** on one to start it
-immediately (one machine per process: Boot is gated while a VM lives).
+immediately (one machine per process: Boot is gated while a VM lives). A
+display boot goes fullscreen: status and buttons hide, the guest owns the
+screen. The floating button (top-right) brings controls back; its
+fullscreen button hides them again.
 Serial output hides behind its toggle; the serial field + **Send** (Done
 dismisses the keyboard) and **^C** reach the guest console. **Kill** stops
 the VM and frees it, returning to `idle` so another OS can boot.
@@ -64,6 +67,17 @@ cursor in guest pixels, gain 2: drag moves (hover, no button), tap
 left-clicks, long-press then drag holds left (window dragging), 2-finger
 tap right-clicks. Verified on the S22 Xfce desktop: right/left swipes move
 the guest cursor across the screen directionally.
+A connected physical mouse (Bluetooth/USB/OTG) takes over automatically:
+its absolute position drives the guest tablet directly — hover moves,
+left/right/middle carry the real button bits, the wheel scrolls — while
+the touchpad toggle shows "Physical mouse connected" and stays disabled
+until the mouse disconnects. (The phone's built-in `sec_touchpad` device
+is not a mouse and is ignored.)
+A paired Bluetooth keyboard types straight into the guest once the first
+frame lands (the display grabs key focus; tapping it refocuses): letters,
+digits, punctuation, navigation, numpad and both modifier sides map to
+Linux evdev codes, Shift-chords included. Volume/power/Back stay with the
+phone.
 
 ## Install screen (Home | Install menu)
 

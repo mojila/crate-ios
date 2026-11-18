@@ -27,7 +27,7 @@ OUT="$REPO/android/libs/arm64-v8a"
 DEPS="$REPO/.deps-android"
 SRC="$DEPS/src"
 WORK="$DEPS/native-build"
-STAMP="glib $GLIB_VERSION, libslirp $SLIRP_VERSION, android arm64 API $MIN_ANDROID"
+STAMP="glib $GLIB_VERSION, libslirp $SLIRP_VERSION, android arm64 API $MIN_ANDROID, patches: $(cd "$REPO/Scripts/patches" && sha256sum libslirp-android.patch | cut -d' ' -f1)"
 
 if [ "$(cat "$REPO/android/libs/Native.version" 2>/dev/null)" = "$STAMP" ] \
     && [ -f "$OUT/libslirp.so" ]; then
@@ -59,6 +59,9 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 tar -xf "$SRC/glib-$GLIB_VERSION.tar.xz" -C "$WORK"
 tar -xf "$SRC/libslirp-v$SLIRP_VERSION.tar.gz" -C "$WORK"
+# Android has no /etc/resolv.conf for slirp's upstream DNS: honor
+# SLIRP_RESOLV_CONF (the app's own resolv.conf) instead.
+patch -p1 -d "$WORK/libslirp-v$SLIRP_VERSION" < "$REPO/Scripts/patches/libslirp-android.patch"
 
 PREFIX="$WORK/prefix"
 mkdir -p "$PREFIX/lib/pkgconfig"

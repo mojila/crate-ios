@@ -57,8 +57,10 @@ object LinuxKeys {
     }
 
     /**
-     * A hardware key by Android [KeyEvent] keycode. Letters, digits, and the
-     * keys the display key row / BT keyboards need; null for the rest.
+     * A hardware key by Android [KeyEvent] keycode. Letters, digits,
+     * punctuation, navigation and both modifier sides — everything a
+     * Bluetooth keyboard sends; null for the rest (volume, power, … stay
+     * with the system). Values are Linux evdev codes.
      */
     fun codeForKeyCode(keyCode: Int): Int? = when (keyCode) {
         in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z ->
@@ -66,23 +68,56 @@ object LinuxKeys {
         in KeyEvent.KEYCODE_1..KeyEvent.KEYCODE_9 ->
             keyCode - KeyEvent.KEYCODE_1 + 2
         KeyEvent.KEYCODE_0 -> 11
-        KeyEvent.KEYCODE_ENTER -> ENTER
+        KeyEvent.KEYCODE_MINUS -> 12
+        KeyEvent.KEYCODE_EQUALS -> 13
+        KeyEvent.KEYCODE_LEFT_BRACKET -> 26
+        KeyEvent.KEYCODE_RIGHT_BRACKET -> 27
+        KeyEvent.KEYCODE_BACKSLASH -> 43
+        KeyEvent.KEYCODE_SEMICOLON -> 39
+        KeyEvent.KEYCODE_APOSTROPHE -> 40
+        KeyEvent.KEYCODE_GRAVE -> 41
+        KeyEvent.KEYCODE_COMMA -> 51
+        KeyEvent.KEYCODE_PERIOD -> 52
+        KeyEvent.KEYCODE_SLASH -> 53
+        KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_DPAD_CENTER,
+        KeyEvent.KEYCODE_NUMPAD_ENTER,
+        -> ENTER
         KeyEvent.KEYCODE_ESCAPE -> ESC
         KeyEvent.KEYCODE_TAB -> TAB
         KeyEvent.KEYCODE_DEL -> BACKSPACE
+        KeyEvent.KEYCODE_FORWARD_DEL -> 111
         KeyEvent.KEYCODE_SPACE -> SPACE
         KeyEvent.KEYCODE_DPAD_UP -> UP
         KeyEvent.KEYCODE_DPAD_DOWN -> DOWN
         KeyEvent.KEYCODE_DPAD_LEFT -> LEFT
         KeyEvent.KEYCODE_DPAD_RIGHT -> RIGHT
+        KeyEvent.KEYCODE_PAGE_UP -> 104
+        KeyEvent.KEYCODE_PAGE_DOWN -> 109
+        KeyEvent.KEYCODE_MOVE_HOME -> 102
+        KeyEvent.KEYCODE_MOVE_END -> 107
+        KeyEvent.KEYCODE_INSERT -> 110
+        KeyEvent.KEYCODE_CAPS_LOCK -> 58
         in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F10 ->
             keyCode - KeyEvent.KEYCODE_F1 + 59
         KeyEvent.KEYCODE_F11 -> 87
         KeyEvent.KEYCODE_F12 -> 88
         KeyEvent.KEYCODE_SHIFT_LEFT -> LEFT_SHIFT
+        KeyEvent.KEYCODE_SHIFT_RIGHT -> 54
         KeyEvent.KEYCODE_CTRL_LEFT -> LEFT_CTRL
+        KeyEvent.KEYCODE_CTRL_RIGHT -> 97
         KeyEvent.KEYCODE_ALT_LEFT -> 56
+        KeyEvent.KEYCODE_ALT_RIGHT -> 100
         KeyEvent.KEYCODE_META_LEFT -> 125
+        KeyEvent.KEYCODE_META_RIGHT -> 126
+        in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 ->
+            // KP1..KP0 are 79..82, KP7..KP9 are 71..73.
+            intArrayOf(82, 79, 80, 81, 75, 76, 77, 71, 72, 73)[
+                keyCode - KeyEvent.KEYCODE_NUMPAD_0]
+        KeyEvent.KEYCODE_NUMPAD_DIVIDE -> 98
+        KeyEvent.KEYCODE_NUMPAD_MULTIPLY -> 55
+        KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> 74
+        KeyEvent.KEYCODE_NUMPAD_ADD -> 78
+        KeyEvent.KEYCODE_NUMPAD_DOT -> 83
         else -> null
     }
 }

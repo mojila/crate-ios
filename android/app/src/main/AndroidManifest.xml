@@ -4,6 +4,8 @@
     <!-- Install phase: the app downloads catalog images itself. The guest's
          user-mode stack remains the engine's own. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Reading the active network's DNS servers for the guest's resolver. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Keep the CPU awake while an install unpacks; the screen timer is
          also held during installs (mirrors iOS isIdleTimerDisabled). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -16,6 +18,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
