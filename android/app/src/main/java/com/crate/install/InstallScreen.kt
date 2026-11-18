@@ -7,10 +7,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import com.crate.app.ui.TipIconButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -78,20 +85,25 @@ fun InstallPanel(
                     fontSize = 14.sp,
                     modifier = Modifier.weight(1f),
                 )
-                Button(onClick = {
-                    val dir = File(Installer.vmsRoot(context), m.id)
-                    onBoot(
-                        BootSpec(
-                            kernel = File(dir, "vmlinuz").absolutePath,
-                            initrd = File(dir, "initrd.img").absolutePath,
-                            cmdline = m.cmdline,
-                            disk = File(dir, "disk.img").absolutePath,
-                            seed = File(dir, "seed.img").absolutePath,
-                            cpus = m.cpus,
-                            memoryMiB = m.memoryGB.toLong() * 1024,
-                        ),
-                    )
-                }) { Text("Boot") }
+                TipIconButton(
+                    icon = Icons.Filled.PlayArrow,
+                    tip = "Boot ${m.name}",
+                    onClick = {
+                        val dir = File(Installer.vmsRoot(context), m.id)
+                        onBoot(
+                            BootSpec(
+                                kernel = File(dir, "vmlinuz").absolutePath,
+                                initrd = File(dir, "initrd.img").absolutePath,
+                                cmdline = m.cmdline,
+                                disk = File(dir, "disk.img").absolutePath,
+                                seed = File(dir, "seed.img").absolutePath,
+                                cpus = m.cpus,
+                                memoryMiB = m.memoryGB.toLong() * 1024,
+                            ),
+                        )
+                    },
+                    filled = true,
+                )
             }
         }
 
@@ -112,10 +124,13 @@ fun InstallPanel(
                         fontSize = 14.sp,
                         modifier = Modifier.weight(1f),
                     )
-                    Button(
+                    TipIconButton(
+                        icon = if (selected?.id == img.id) Icons.Filled.RadioButtonChecked
+                            else Icons.Filled.RadioButtonUnchecked,
+                        tip = "Select ${img.name} ${img.version}",
                         onClick = { selected = img },
                         enabled = !installer.busy,
-                    ) { Text(if (selected?.id == img.id) "●" else "Pick") }
+                    )
                 }
             }
         }
@@ -129,17 +144,22 @@ fun InstallPanel(
                 visualTransformation = PasswordVisualTransformation())
             TextField(value = hostname, onValueChange = { hostname = it },
                 label = { Text("hostname") }, singleLine = true)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TipIconButton(
+                    icon = Icons.Filled.Download,
+                    tip = "Install",
                     onClick = {
                         installer.install(img, 4, 12, user, password, hostname)
                     },
                     enabled = !installer.busy && user.isNotBlank() && password.isNotEmpty(),
-                ) { Text("Install") }
-                Button(
+                    filled = true,
+                )
+                TipIconButton(
+                    icon = Icons.Filled.Close,
+                    tip = "Cancel",
                     onClick = { installer.cancel() },
                     enabled = installer.busy,
-                ) { Text("Cancel") }
+                )
             }
         }
 
@@ -162,11 +182,19 @@ fun InstallPanel(
             is Installer.Phase.Done -> {
                 Text("installed ${p.machine.name} — tap Boot above", fontSize = 14.sp,
                     modifier = Modifier.padding(top = 4.dp))
-                Button(onClick = { installer.reset() }) { Text("OK") }
+                TipIconButton(
+                    icon = Icons.Filled.Check,
+                    tip = "OK",
+                    onClick = { installer.reset() },
+                )
             }
             is Installer.Phase.Failed -> {
                 Text("install failed: ${p.message}", fontSize = 14.sp)
-                Button(onClick = { installer.reset() }) { Text("OK") }
+                TipIconButton(
+                    icon = Icons.Filled.Check,
+                    tip = "OK",
+                    onClick = { installer.reset() },
+                )
             }
             is Installer.Phase.Idle -> {}
         }

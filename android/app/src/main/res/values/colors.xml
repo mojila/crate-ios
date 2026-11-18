@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Launcher background. The artwork is dark navy to its edges (with
+         rounded, possibly transparent corners), so a matching navy hides any
+         seam where the mask crops the foreground layer. -->
+    <color name="ic_launcher_background">#1A2230</color>
+</resources>

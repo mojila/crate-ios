@@ -76,7 +76,7 @@ the key row (Esc/Tab/arrows) and touch reaches the guest tablet — both JNI
 paths verified crash-free. Real pixels need a desktop disk image (Install
 screen); frames render as Fit-scaled ARGB with a frame counter.
 
-## Install screen (Console | Install toggle)
+## Install screen (Home | Install menu)
 
 Fetches the catalog, downloads a Debian Xfce image (kernel + initrd + xz
 disk parts, each SHA-256-checked), unpacks the disk sparsely (Rust
@@ -102,6 +102,43 @@ Xfce desktop renders in the display panel (frames flow) while serial shows
 `INTERNET` permission (declared) and holds a wake lock for the download;
 leaving the screen returns to the same state (VM files persist, install
 re-runs cleanly from the panel).
+
+## Theme (dark mode)
+
+The app follows the system theme by default and lets you pin Light or Dark
+from the **Settings** menu (Home | Install | Settings, Home selected by
+default): Appearance offers System / Light / Dark radio rows, persisted
+across restarts. Both schemes are baseline Material3, so the familiar
+purple buttons work in each; the status/navigation bars and launch
+background (`values-night/themes.xml`) match the active scheme. System theme
+changes are handled in-place (`uiMode` config change, verified: a running
+VM keeps running), never by recreating the activity.
+
+## Icon buttons
+
+Text buttons are `TipIconButton` (`com.crate.app.ui`, icon + long-press
+`PlainTooltip` + TalkBack description). Active tab / primary row action is
+filled: Console `Terminal`, Install `Download`, theme cycler reflects the
+mode (`BrightnessAuto`/`LightMode`/`DarkMode`), Send `Send`, Start/Boot
+`PlayArrow`, Ctrl+C `Keyboard`, Kill `Stop`, catalog pick
+`RadioButtonUnchecked/Checked`, install confirm `Download`, Cancel `Close`,
+dismiss `Check`. The display key row stays text — Esc/Tab/arrow glyphs are
+already minimal and clearer as labels. Needs both
+`material-icons-core` (Play/Send/Close/Check live there) and
+`material-icons-extended`; the pair balloons the debug APK (~79 MB vs ~34
+MB, no shrinking) — release should enable minify if size matters.
+
+## Launcher icon
+`mipmap-anydpi-v26/ic_launcher.xml` (+ `-round`) is a pure adaptive icon —
+no legacy PNGs needed since minSdk 33 guarantees adaptive support. The
+foreground (`drawable-nodpi/ic_launcher_foreground.png`, 512 px, downscaled
+from the provided artwork) is full-bleed dark navy, so the background
+(`values/colors.xml`, `#1A2230`) only peeks through the mask crop and blends
+with the artwork edges. Manifest also pins `android:label="Crate"` (there
+was none). Verified in the Samsung Finder: gear emblem + "Crate" label.
+Note: the artwork's bottom wordmark reads "CRETE" and sits near the mask
+edge — round masks crop it, squircle shows it. If that bothers you, say the
+word and I'll re-crop the foreground to the gear emblem (mask-safe).
 
 ## JNI contract (rust-bridge/src/lib.rs)
 
