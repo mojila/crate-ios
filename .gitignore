@@ -19,3 +19,16 @@ Crate.xcodeproj/
 *.log
 Frameworks/
 .deps/
+
+# Android port (iOS Frameworks/ equivalent: fetched, never committed)
+android/libs/
+android/rust-bridge/.cargo/
+android/rust-bridge/target/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+# Staged by Scripts/android-build-engine.sh from android/libs/
+android/app/src/main/jniLibs/
+android/app/src/main/assets/native/
+.deps-android/

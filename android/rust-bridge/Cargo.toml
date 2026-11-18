@@ -1,0 +1,27 @@
+[package]
+name = "crate-android-bridge"
+description = "JNI bridge and on-device boot-test binary for crate on Android (see(crate) crate-ffi for the C API the app will use)"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[lib]
+name = "crate_jni"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "crate-boot-test"
+path = "src/bin/boot_test.rs"
+
+# The engine, fetched as source by Scripts/android-fetch-engine.sh (pinned
+# tag + commit, Android patches applied). Relative paths: the checkout lives
+# in .deps-android/ and is never committed, like iOS's Frameworks/.
+[dependencies]
+crate-core = { path = "../../.deps-android/engine-src/crates/crate-core" }
+crate-ffi = { path = "../../.deps-android/engine-src/crates/crate-ffi" }
+crate-virt = { path = "../../.deps-android/engine-src/crates/crate-virt" }
+crate-host = { path = "../../.deps-android/engine-src/crates/crate-host" }
+crate-jit = { path = "../../.deps-android/engine-src/crates/crate-jit" }
+jni = "0.21"
+lzma-rs = "0.3"
+sha2 = "0.10"

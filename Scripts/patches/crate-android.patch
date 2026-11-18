@@ -1,0 +1,84 @@
+From bd2efb4ae9d8567d581b1e6c2313ac21a112f1f2 Mon Sep 17 00:00:00 2001
+From: crate-android port
+Date: Wed, 18 Nov 2026 00:00:00 +0000
+Subject: [PATCH] Android: use the Linux JIT memory and cache maintenance code
+
+crate-host gates its executable-memory helpers on target_os = "linux",
+which Android (target_os = "android") misses although Bionic provides
+everything they use: memfd_create (API 30+; we target API 33+), dual
+shared mappings, and user-space CTR_EL0 with IC/DC maintenance on
+aarch64. Widen the three gates; no behaviour change on any other target.
+
+The enter/epilogue trampolines name Mach-O symbols (_foo) literally.
+Name them through sym operands instead, which the compiler spells
+per object format (_foo on Mach-O, foo on ELF); the rest of the block
+is plain A64. No behaviour change on Apple targets.
+
+Upstream note: offered for inclusion in oneamendez/crate; carried here
+like Scripts/patches/* until then.
+diff --git a/crates/crate-host/src/jit.rs b/crates/crate-host/src/jit.rs
+index 42e7c07..46e9bb4 100644
+--- a/crates/crate-host/src/jit.rs
++++ b/crates/crate-host/src/jit.rs
+@@ -392,7 +392,7 @@ unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
+     Ok((exec as *mut u8, write.cast()))
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
+     let fail = |what: &str| Error::Jit(format!("{what}: {}", std::io::Error::last_os_error()));
+     // SAFETY: the name is a valid C string.
+@@ -490,7 +490,7 @@ unsafe fn flush_icache_ranges(base: *mut u8, ranges: &[(usize, usize)]) {
+ /// # Safety
+ ///
+ /// Every range, from `base`, must be mapped and readable.
+-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+ unsafe fn flush_icache_ranges(base: *mut u8, ranges: &[(usize, usize)]) {
+     use std::arch::asm;
+     if ranges.is_empty() {
+@@ -531,7 +531,7 @@ unsafe fn flush_icache_ranges(base: *mut u8, ranges: &[(usize, usize)]) {
+ /// # Safety
+ ///
+ /// The range must be mapped and readable.
+-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
++#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
+ unsafe fn flush_icache(start: *mut u8, len: usize) {
+     use std::arch::asm;
+     let ctr: u64;
+diff --git a/crates/crate-jit/src/backend.rs b/crates/crate-jit/src/backend.rs
+index 2c2b247..88e0995 100644
+--- a/crates/crate-jit/src/backend.rs
++++ b/crates/crate-jit/src/backend.rs
+@@ -37,8 +37,8 @@ unsafe extern "C" {
+ 
+ core::arch::global_asm!(
+     ".p2align 2",
+-    ".globl _crate_jit_enter",
+-    "_crate_jit_enter:",
++    ".globl {enter}",
++    "{enter}:",
+     // Save the host's callee-saved registers and make a frame.
+     "stp x29, x30, [sp, #-176]!",
+     "stp x19, x20, [sp, #16]",
+@@ -97,8 +97,8 @@ core::arch::global_asm!(
+     // Jump to the block.
+     "ldr x16, [sp, #{dispatch}]",
+     "br x16",
+-    ".globl _crate_jit_epilogue",
+-    "_crate_jit_epilogue:",
++    ".globl {epilogue}",
++    "{epilogue}:",
+     // Reached from a stub with SP = state block; return the exit code.
+     "ldr w0, [sp, #{exit}]",
+     "ldr x9, [sp, #{host_sp}]",
+@@ -121,6 +121,8 @@ core::arch::global_asm!(
+     x = const offsets::X,
+     dispatch = const offsets::DISPATCH_TARGET,
+     exit = const offsets::EXIT,
++    enter = sym crate_jit_enter,
++    epilogue = sym crate_jit_epilogue,
+ );
+ 
+ // The guest's FPCR and FPSR live in the host's registers of this thread (see
