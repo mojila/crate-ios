@@ -43,38 +43,27 @@ Rust `aarch64-linux-android` target, `cargo-ndk`, meson, ninja, an arm64
 ./Scripts/android-boot-test.sh debian-xfce   # headless boot proof on device
 ```
 
-Then the app (first build downloads AGP/Kotlin — a few minutes):
+Then the app (first build downloads AGP/Kotlin — a few minutes), install it,
+open it, and install an OS from the Install tab — no manual file pushes
+(the headless script above covers the no-app boot proof):
 
 ```sh
 cd android && ./gradlew :app:assembleDebug
-```
-
-Push the guest kernel/initrd where the app can read them (its external
-files dir — no permissions needed for the app's own dir):
-
-```sh
-adb shell mkdir -p /sdcard/Android/data/com.crate.app/files/crate
-adb push .deps-android/images/debian-xfce/debian-xfce-vmlinuz \
-    /sdcard/Android/data/com.crate.app/files/crate/vmlinuz
-adb push .deps-android/images/debian-xfce/debian-xfce-initrd.img \
-    /sdcard/Android/data/com.crate.app/files/crate/initrd.img
-# Pushed files land shell-owned without other-read; the app needs that:
-adb shell chmod 755 /sdcard/Android/data/com.crate.app/files/crate
-adb shell chmod 644 /sdcard/Android/data/com.crate.app/files/crate/*
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Open the app, tap **Start**: the serial log streams, ending at a `#` shell
-prompt (verified: `uname` → `Linux`). Type into the field + **Send**
-(Done dismisses the keyboard), or **^C** to interrupt. **Kill** stops the
-VM and frees it, returning to `idle` so **Start** can boot again.
-
-Check **Display (GPU) at boot** to register the virtio GPU + tablet/keyboard
-inputs (`setDisplayActive`, mirroring iOS `DisplayBridge`). The serial guest
-has no GUI so no frames arrive (`frames: 0`), but the display panel shows
-the key row (Esc/Tab/arrows) and touch reaches the guest tablet — both JNI
-paths verified crash-free. Real pixels need a desktop disk image (Install
-screen); frames render as Fit-scaled ARGB with a frame counter.
+Home lists installed operating systems — tap **Boot** on one to start it
+immediately (one machine per process: Boot is gated while a VM lives).
+Serial output hides behind its toggle; the serial field + **Send** (Done
+dismisses the keyboard) and **^C** reach the guest console. **Kill** stops
+the VM and frees it, returning to `idle` so another OS can boot.
+coordinates scale guest pixels to crate's 0..32767 tablet range (mirroring
+iOS `DisplayBridge.pointer`); sending raw pixels lands in the top-left ~3%.
+Touchpad mode (default; mouse icon toggles to direct touch) keeps a virtual
+cursor in guest pixels, gain 2: drag moves (hover, no button), tap
+left-clicks, long-press then drag holds left (window dragging), 2-finger
+tap right-clicks. Verified on the S22 Xfce desktop: right/left swipes move
+the guest cursor across the screen directionally.
 
 ## Install screen (Home | Install menu)
 
@@ -88,10 +77,10 @@ SHA-512-crypt password hash, meta-data, vendor-data). Mirrors iOS
 
 VMs live in internal storage (`filesDir/VMs/<uuid>/`: `vmlinuz`,
 `initrd.img`, `disk.img`, `seed.img`, `machine.json`) — internal storage is
-sparse-capable, emulated external storage may not be. **Boot** on a machine
-boots its desktop (`root=/dev/vda` from the catalog cmdline) with display
-forced on; **Kill** frees it. Native methods live on
-`com.crate.install.Installer` (same `libcrate_jni.so`).
+sparse-capable, emulated external storage may not be. When an install
+finishes, OK jumps back to Home where the new OS is listed with **Boot**.
+Native methods live on `com.crate.install.Installer` (same
+`libcrate_jni.so`).
 
 Verified on the S22 2026-11-18: Debian Xfce installed from the catalog over
 the phone's own network (668 MiB, SHA-256-checked per file and for the
@@ -103,12 +92,15 @@ Xfce desktop renders in the display panel (frames flow) while serial shows
 leaving the screen returns to the same state (VM files persist, install
 re-runs cleanly from the panel).
 
-## Theme (dark mode)
+## Settings (theme + VM)
 
 The app follows the system theme by default and lets you pin Light or Dark
 from the **Settings** menu (Home | Install | Settings, Home selected by
 default): Appearance offers System / Light / Dark radio rows, persisted
-across restarts. Both schemes are baseline Material3, so the familiar
+across restarts. A Virtual machine section holds **Display (GPU) at boot**
+(on by default, persisted the same way): off is the lean serial-console
+path — boots skip the virtio GPU, show no display panel, and stay in
+portrait. Both schemes are baseline Material3, so the familiar
 purple buttons work in each; the status/navigation bars and launch
 background (`values-night/themes.xml`) match the active scheme. System theme
 changes are handled in-place (`uiMode` config change, verified: a running
@@ -118,11 +110,14 @@ VM keeps running), never by recreating the activity.
 
 Text buttons are `TipIconButton` (`com.crate.app.ui`, icon + long-press
 `PlainTooltip` + TalkBack description). Active tab / primary row action is
-filled: Console `Terminal`, Install `Download`, theme cycler reflects the
-mode (`BrightnessAuto`/`LightMode`/`DarkMode`), Send `Send`, Start/Boot
+filled: Home `Home`, Install `Download`, Settings `Settings`, per-OS Boot
 `PlayArrow`, Ctrl+C `Keyboard`, Kill `Stop`, catalog pick
 `RadioButtonUnchecked/Checked`, install confirm `Download`, Cancel `Close`,
-dismiss `Check`. The display key row stays text — Esc/Tab/arrow glyphs are
+dismiss `Check`, serial-input toggle `Terminal` (field + Send `Send` hide
+behind it, default hidden), console-output toggle `Subject` (log hides
+behind it, default hidden — state line and display stay visible). The
+display key row
+stays text — Esc/Tab/arrow glyphs are
 already minimal and clearer as labels. Needs both
 `material-icons-core` (Play/Send/Close/Check live there) and
 `material-icons-extended`; the pair balloons the debug APK (~79 MB vs ~34

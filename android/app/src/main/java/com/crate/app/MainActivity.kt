@@ -3,6 +3,8 @@ package com.crate.app
 import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import androidx.activity.ComponentActivity
@@ -13,18 +15,24 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Checkbox
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
@@ -37,7 +45,10 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Subject
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.TouchApp
+import com.crate.app.ui.SectionCard
 import com.crate.app.ui.TipIconButton
 import com.crate.app.ui.theme.CrateTheme
 import com.crate.app.ui.theme.ThemeMode
@@ -100,11 +111,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val guestDir = File(getExternalFilesDir(null), "crate")
         setContent {
             var mode by remember { mutableStateOf(ThemeMode.load(this)) }
             CrateTheme(mode) {
-                App(engine, guestDir, themeMode = mode, onThemeMode = {
+                App(engine, themeMode = mode, onThemeMode = {
                     mode = it
                     ThemeMode.save(this, it)
                 })
@@ -121,7 +131,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun App(
     engine: Engine,
-    guestDir: File,
     themeMode: ThemeMode,
     onThemeMode: (ThemeMode) -> Unit,
 ) {
@@ -130,7 +139,7 @@ private fun App(
     var engineVer by remember { mutableStateOf("") }
     var loadError by remember { mutableStateOf<String?>(null) }
     var tab by remember { mutableStateOf(Tab.Home) }
-    var pendingBoot by remember { mutableStateOf<BootSpec?>(null) }
+    var displayAtBoot by remember { mutableStateOf(VmPrefs.loadDisplayAtBoot(context)) }
     val installer = remember { Installer(context.applicationContext) }
 
     // Load natives once, off the main thread.
@@ -148,10 +157,11 @@ private fun App(
         }, "native-load").start()
     }
 
-    // While a machine exists, pin landscape + hide the status bar for a
-    // full-screen guest; restore on kill (stateText returns to "idle" in
-    // destroy()). Keyed on stateText — isLive is a plain getter, not state.
-    val booted = engine.stateText != "idle"
+    // While a display machine lives, pin landscape + hide the status bar
+    // for a full-screen guest; restore on kill (stateText returns to "idle"
+    // in destroy()). Keyed on stateText — isLive is a plain getter, not
+    // state. Serial-only boots stay in portrait.
+    val booted = engine.stateText != "idle" && displayAtBoot
     LaunchedEffect(booted) {
         val activity = context as? Activity ?: return@LaunchedEffect
         if (booted) {
@@ -172,6 +182,7 @@ private fun App(
     Column(
         modifier = Modifier.fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
             .navigationBarsPadding()
             .imePadding()
             .padding(12.dp),
@@ -198,150 +209,233 @@ private fun App(
             )
         }
         when (tab) {
-            Tab.Install -> InstallPanel(installer, context.applicationContext, onBoot = {
-                pendingBoot = it
+            Tab.Install -> InstallPanel(installer, context.applicationContext, onInstalled = {
                 tab = Tab.Home
             })
             Tab.Settings -> SettingsScreen(
                 themeMode = themeMode,
                 onThemeMode = onThemeMode,
+                displayAtBoot = displayAtBoot,
+                onDisplayAtBoot = {
+                    displayAtBoot = it
+                    VmPrefs.saveDisplayAtBoot(context, it)
+                },
                 engineVer = engineVer,
             )
-            Tab.Home -> ConsoleScreen(engine, guestDir, pendingBoot, libsReady, engineVer, loadError)
+            Tab.Home -> HomeScreen(engine, displayAtBoot, libsReady, engineVer, loadError)
         }
     }
 }
 
 @Composable
-private fun ConsoleScreen(
+private fun HomeScreen(
     engine: Engine,
-    guestDir: File,
-    bootSpec: BootSpec?,
+    displayAtBoot: Boolean,
     libsReady: Boolean,
     engineVer: String,
     loadError: String?,
 ) {
+    val context = LocalContext.current
+    // Reloaded every visit: Home recomposes fresh whenever the tab is
+    // selected, so a just-installed OS shows up after Install's OK jump.
+    var machines by remember { mutableStateOf(Installer.machines(context.applicationContext)) }
     var bootError by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var bootedName by remember { mutableStateOf<String?>(null) }
     var input by remember { mutableStateOf("") }
-    var withDisplay by remember { mutableStateOf(false) }
+    var showSerialInput by remember { mutableStateOf(false) }
+    var showConsole by remember { mutableStateOf(false) }
     val scroll = rememberScrollState()
     val focus = LocalFocusManager.current
+
+    /** Boot a VM immediately on its own thread (create is slow). */
+    fun boot(name: String, spec: BootSpec) {
+        busy = true
+        bootError = null
+        bootedName = name
+        Thread({
+            try {
+                if (engine.isLive) engine.destroy()
+                engine.create(
+                    kernel = spec.kernel,
+                    initrd = spec.initrd,
+                    cmdline = spec.cmdline,
+                    cpus = spec.cpus,
+                    memoryMiB = spec.memoryMiB,
+                    withDisplay = displayAtBoot,
+                    disk = spec.disk,
+                    seed = spec.seed,
+                )
+                engine.start()
+                // Frames flow only while the display is active
+                // (mirrors iOS DisplayBridge.attach).
+                if (displayAtBoot) engine.setDisplayActive(true)
+            } catch (e: EngineException) {
+                bootError = e.message
+                bootedName = null
+            } catch (e: Exception) {
+                bootError = e.message
+                bootedName = null
+            } finally {
+                busy = false
+            }
+        }, "vm-boot").start()
+    }
+
+    /** Kill the machine, then free it so another OS can boot. */
+    fun kill() {
+        Thread({
+            try {
+                engine.kill()
+            } finally {
+                // Let the state callback land, then free the machine.
+                try {
+                    Thread.sleep(500)
+                } catch (_: InterruptedException) {
+                }
+                engine.destroy()
+                bootedName = null
+            }
+        }, "vm-kill").start()
+    }
 
     LaunchedEffect(engine.consoleText) {
         scroll.scrollTo(scroll.maxValue)
     }
 
+    // Status up top, scrollable content in the middle, action bar pinned
+    // to the bottom so Kill/^C stay reachable even when the guest display
+    // fills the screen.
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text("state: ${engine.stateText} $engineVer", fontSize = 14.sp)
-        loadError?.let { Text("native load: $it", fontSize = 14.sp) }
-        bootError?.let { Text("boot: $it", fontSize = 14.sp) }
-
-        // Guest screen, once the GPU produces frames (needs Display
-        // checked at boot + a graphical guest; the /bin/sh guest has none).
-        // The panel shows while the machine lives so touch/keys are usable
-        // even before the first frame. Installed VMs always boot with display.
-        if ((withDisplay || bootSpec != null) && engine.isLive) {
-            DisplayPanel(engine)
+        SectionCard("Status") {
+            val status = if (engine.isLive) {
+                "Running${bootedName?.let { " — $it" } ?: ""}"
+            } else {
+                "Idle"
+            }
+            Text("$status  $engineVer", fontSize = 14.sp)
+            if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            loadError?.let {
+                Text("native load: $it", fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.error)
+            }
+            bootError?.let {
+                Text("boot: $it", fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.error)
+            }
         }
 
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth(),
+        Column(
+            modifier = Modifier.weight(1f).verticalScroll(scroll),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Checkbox(
-                checked = withDisplay,
-                onCheckedChange = { withDisplay = it },
-                enabled = !engine.isLive,
-            )
-            Text("Display (GPU) at boot", fontSize = 14.sp)
+            // Installed operating systems. Boot starts the VM immediately;
+            // one machine per process, so Boot is gated while one lives.
+            // Hidden while a VM runs — nothing to start until it stops.
+            if (!engine.isLive) {
+                SectionCard("Machines") {
+                    if (machines.isEmpty()) {
+                        Text("none yet — grab one from Install", fontSize = 14.sp)
+                    }
+                    for (m in machines) {
+                        ListItem(
+                            headlineContent = { Text("${m.name} ${m.version}") },
+                            supportingContent = {
+                                Text("${m.desktop} • ${m.memoryGB}G RAM / ${m.diskGB}G disk")
+                            },
+                            trailingContent = {
+                                TipIconButton(
+                                    icon = Icons.Filled.PlayArrow,
+                                    tip = "Boot ${m.name}",
+                                    onClick = {
+                                        val dir = File(
+                                            Installer.vmsRoot(context.applicationContext), m.id)
+                                        boot(
+                                            m.name,
+                                            BootSpec(
+                                                kernel = File(dir, "vmlinuz").absolutePath,
+                                                initrd = File(dir, "initrd.img").absolutePath,
+                                                cmdline = m.cmdline,
+                                                disk = File(dir, "disk.img").absolutePath,
+                                                seed = File(dir, "seed.img").absolutePath,
+                                                cpus = m.cpus,
+                                                memoryMiB = m.memoryGB.toLong() * 1024,
+                                            ),
+                                        )
+                                    },
+                                    enabled = libsReady && !busy,
+                                    filled = true,
+                                )
+                            },
+                        )
+                    }
+                }
+            }
+
+            // Guest screen first when a display VM runs, so touch/keys are
+            // usable before the first frame. Hidden for serial-only boots.
+            // Carded like every other section; the panel caps its own height
+            // so the key strip + action bar stay on screen with it.
+            if (displayAtBoot && engine.isLive) {
+                SectionCard("Display") {
+                    DisplayPanel(engine)
+                }
+            }
+
+            // Serial console output + input share one card, each behind its
+            // action-bar toggle (both default hidden).
+            if (engine.isLive && (showConsole || showSerialInput)) {
+                SectionCard("Console") {
+                    if (showConsole) {
+                        Text(
+                            text = engine.consoleText.ifEmpty { "(console idle)" },
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            modifier = Modifier.fillMaxWidth().verticalScroll(scroll),
+                        )
+                    }
+                    if (showSerialInput) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextField(
+                                value = input,
+                                onValueChange = { input = it },
+                                label = { Text("serial input") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                                keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
+                                modifier = Modifier.weight(1f),
+                            )
+                            TipIconButton(
+                                icon = Icons.Filled.Send,
+                                tip = "Send",
+                                onClick = {
+                                    engine.writeText(input + "\n")
+                                    input = ""
+                                },
+                                enabled = libsReady && engine.isLive,
+                            )
+                        }
+                    }
+                }
+            }
         }
 
-        Text(
-            text = engine.consoleText.ifEmpty { "(console idle)" },
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(scroll),
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextField(
-                value = input,
-                onValueChange = { input = it },
-                label = { Text("serial input") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
-                modifier = Modifier.weight(1f),
-            )
-            TipIconButton(
-                icon = Icons.Filled.Send,
-                tip = "Send",
-                onClick = {
-                    engine.writeText(input + "\n")
-                    input = ""
-                },
-                enabled = libsReady && engine.isLive,
-            )
-        }
-
+        HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             TipIconButton(
-                icon = Icons.Filled.PlayArrow,
-                tip = "Start",
-                onClick = {
-                    busy = true
-                    bootError = null
-                    Thread({
-                        try {
-                            if (engine.isLive) engine.destroy()
-                            val spec = bootSpec
-                            if (spec != null) {
-                                // Installed VM: desktop boot off its own disk.
-                                engine.create(
-                                    kernel = spec.kernel,
-                                    initrd = spec.initrd,
-                                    cmdline = spec.cmdline,
-                                    cpus = spec.cpus,
-                                    memoryMiB = spec.memoryMiB,
-                                    withDisplay = true,
-                                    disk = spec.disk,
-                                    seed = spec.seed,
-                                )
-                            } else {
-                                val kernel = File(guestDir, "vmlinuz")
-                                val initrd = File(guestDir, "initrd.img")
-                                require(kernel.exists()) { "missing ${kernel.absolutePath}" }
-                                require(initrd.exists()) { "missing ${initrd.absolutePath}" }
-                                // Same guest shape as Scripts/android-boot-test.sh:
-                                // straight into /bin/sh, no root device needed.
-                                engine.create(
-                                    kernel = kernel.absolutePath,
-                                    initrd = initrd.absolutePath,
-                                    cmdline = "console=ttyAMA0 rdinit=/bin/sh",
-                                    cpus = 4,
-                                    memoryMiB = 1024,
-                                    withDisplay = withDisplay,
-                                )
-                            }
-                            engine.start()
-                            // Frames flow only while the display is active
-                            // (mirrors iOS DisplayBridge.attach).
-                            if (withDisplay || spec != null) engine.setDisplayActive(true)
-                        } catch (e: EngineException) {
-                            bootError = e.message
-                        } catch (e: Exception) {
-                            bootError = e.message
-                        } finally {
-                            busy = false
-                        }
-                    }, "vm-boot").start()
-                },
-                enabled = libsReady && !busy && (!engine.isLive || engine.stateText.startsWith("stopped")),
+                icon = Icons.Filled.Terminal,
+                tip = if (showSerialInput) "Hide serial input" else "Show serial input",
+                onClick = { showSerialInput = !showSerialInput },
+                filled = showSerialInput,
+            )
+            TipIconButton(
+                icon = Icons.Filled.Subject,
+                tip = if (showConsole) "Hide console" else "Show console",
+                onClick = { showConsole = !showConsole },
+                filled = showConsole,
             )
             TipIconButton(
                 icon = Icons.Filled.Keyboard,
@@ -352,21 +446,7 @@ private fun ConsoleScreen(
             TipIconButton(
                 icon = Icons.Filled.Stop,
                 tip = "Kill",
-                onClick = {
-                    Thread({
-                        try {
-                            engine.kill()
-                        } finally {
-                            // Let the state callback land, then free the
-                            // machine so Start can boot again.
-                            try {
-                                Thread.sleep(500)
-                            } catch (_: InterruptedException) {
-                            }
-                            engine.destroy()
-                        }
-                    }, "vm-kill").start()
-                },
+                onClick = { kill() },
                 enabled = libsReady && engine.isLive,
             )
         }
@@ -376,8 +456,16 @@ private fun ConsoleScreen(
 /**
  * Maps a touch on the display view into guest tablet coordinates.
  * Returns true (event consumed). View is Fit-scaled, so the touch maps
- * linearly into guest pixels.
+ * linearly into guest pixels, then up to crate's 0..32767 tablet range
+ * (mirrors iOS DisplayBridge.pointer — raw guest pixels only use the
+ * top-left ~3% of the tablet).
  */
+private fun sendTablet(engine: Engine, gx: Int, gy: Int, guestW: Int, guestH: Int, buttons: Int) {
+    val nx = (gx.toFloat() / guestW.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+    val ny = (gy.toFloat() / guestH.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+    engine.sendPointer((nx * 32767f).toInt(), (ny * 32767f).toInt(), buttons)
+}
+
 private fun guestTouch(
     engine: Engine,
     viewSize: IntSize,
@@ -393,10 +481,10 @@ private fun guestTouch(
     when (event.action) {
         android.view.MotionEvent.ACTION_DOWN,
         android.view.MotionEvent.ACTION_MOVE,
-        -> engine.sendPointer(x, y, 1)
+        -> sendTablet(engine, x, y, guestW, guestH, 1)
         android.view.MotionEvent.ACTION_UP,
         android.view.MotionEvent.ACTION_CANCEL,
-        -> engine.sendPointer(x, y, 0)
+        -> sendTablet(engine, x, y, guestW, guestH, 0)
     }
     return true
 }
@@ -423,6 +511,8 @@ private class PadState {
     var moved = false
     var multi = false
     var held = false
+    /** Bumps every gesture end; stale long-press timers no-op on mismatch. */
+    var gestureId = 0
 }
 
 /** Touchpad gain: one full-width swipe crosses ~2 guest screens. */
@@ -436,6 +526,8 @@ private fun padEvent(
     guestH: Int,
     slop: Float,
     longPressMs: Long,
+    onDown: () -> Unit,
+    onEnd: () -> Unit,
     event: android.view.MotionEvent,
 ): Boolean {
     // Recenter when the guest mode changes (boot, resolution switch).
@@ -453,9 +545,11 @@ private fun padEvent(
     val sx = guestW / w.toFloat() * PAD_GAIN
     val sy = guestH / h.toFloat() * PAD_GAIN
     fun send() {
-        engine.sendPointer(
+        sendTablet(
+            engine,
             pad.x.toInt().coerceIn(0, maxX),
             pad.y.toInt().coerceIn(0, maxY),
+            guestW, guestH,
             if (pad.held) 1 else 0,
         )
     }
@@ -469,6 +563,7 @@ private fun padEvent(
             pad.moved = false
             pad.multi = false
             pad.held = false
+            onDown()
         }
         android.view.MotionEvent.ACTION_POINTER_DOWN -> pad.multi = true
         android.view.MotionEvent.ACTION_MOVE -> {
@@ -492,19 +587,21 @@ private fun padEvent(
             pad.lastY = y
         }
         android.view.MotionEvent.ACTION_UP -> {
+            onEnd()
             if (pad.multi && !pad.moved) {
-                engine.sendPointer(pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), 2)
-                engine.sendPointer(pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), 0)
+                sendTablet(engine, pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), guestW, guestH, 2)
+                sendTablet(engine, pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), guestW, guestH, 0)
             } else if (pad.held) {
                 pad.held = false
                 send()
             } else if (!pad.moved) {
-                engine.sendPointer(pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), 1)
-                engine.sendPointer(pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), 0)
+                sendTablet(engine, pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), guestW, guestH, 1)
+                sendTablet(engine, pad.x.toInt().coerceIn(0, maxX), pad.y.toInt().coerceIn(0, maxY), guestW, guestH, 0)
             }
             pad.held = false
         }
         android.view.MotionEvent.ACTION_CANCEL -> {
+            onEnd()
             if (pad.held) {
                 pad.held = false
                 send()
@@ -543,23 +640,55 @@ private fun DisplayPanel(engine: Engine) {
     val viewConfig = LocalViewConfiguration.current
     val slop = viewConfig.touchSlop
     val longPressMs = viewConfig.longPressTimeoutMillis
+    // Long-press arm: a still finger sends no MOVE events, so the hold
+    // can't be detected in the event stream alone — a timer fires it.
+    val holdTimer = remember { Handler(Looper.getMainLooper()) }
     fun handleTouch(viewW: IntSize, gw: Int, gh: Int, event: android.view.MotionEvent): Boolean {
         focusRequester.requestFocus()
         return if (touchpad) {
-            padEvent(engine, pad, viewW, gw, gh, slop, longPressMs, event)
+            padEvent(engine, pad, viewW, gw, gh, slop, longPressMs,
+                onDown = {
+                    pad.gestureId++
+                    val id = pad.gestureId
+                    holdTimer.postDelayed({
+                        if (pad.gestureId == id && !pad.moved && !pad.multi && !pad.held) {
+                            pad.held = true
+                            val maxX = (pad.gw - 1).coerceAtLeast(0)
+                            val maxY = (pad.gh - 1).coerceAtLeast(0)
+                            sendTablet(
+                                engine,
+                                pad.x.toInt().coerceIn(0, maxX),
+                                pad.y.toInt().coerceIn(0, maxY),
+                                pad.gw.coerceAtLeast(1), pad.gh.coerceAtLeast(1), 1,
+                            )
+                        }
+                    }, longPressMs)
+                },
+                onEnd = { pad.gestureId++ },
+                event = event,
+            )
         } else {
             guestTouch(engine, viewW, gw, gh, event)
         }
     }
 
     if (img != null) {
+    // fillMaxWidth + aspectRatio keeps the 1280x800 guest proportional.
+    // wrapContentHeight alone collapsed to a sliver (unbounded scroll
+    // constraints give the image no height to resolve against).
+    val aspect = if (engine.frameWidth > 0 && engine.frameHeight > 0) {
+        engine.frameWidth.toFloat() / engine.frameHeight.toFloat()
+    } else {
+        16f / 10f
+    }
     Image(
         bitmap = img,
         contentDescription = "guest display",
         contentScale = ContentScale.Fit,
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(engine.frameWidth.toFloat() / engine.frameHeight.coerceAtLeast(1).toFloat())
+            .aspectRatio(aspect)
+            .heightIn(max = 520.dp)
             .onSizeChanged { viewSize = it }
             .focusRequester(focusRequester)
             .focusable()
@@ -592,7 +721,12 @@ private fun DisplayPanel(engine: Engine) {
         )
     }
 
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    // Compact key strip: one horizontally-scrollable row of small buttons
+    // so it never stacks into a tall block that pushes the display away.
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.horizontalScroll(rememberScrollState()),
+    ) {
         for ((label, code) in listOf(
             "Esc" to LinuxKeys.ESC,
             "Tab" to LinuxKeys.TAB,
@@ -604,7 +738,8 @@ private fun DisplayPanel(engine: Engine) {
             Button(
                 onClick = { engine.tapKey(code) },
                 enabled = engine.isLive,
-            ) { Text(label) }
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+            ) { Text(label, fontSize = 12.sp) }
         }
     }
     Row(

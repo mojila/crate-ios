@@ -14,9 +14,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import com.crate.app.ui.SectionCard
 import com.crate.app.ui.TipIconButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -28,19 +28,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.crate.app.BootSpec
-import java.io.File
 
 /**
- * Install phase UI: lists installed VMs (Boot) and the catalog (Install).
- * The download runs while the app is open; leaving the screen keeps it
- * going, cancelling or failure removes the VM's files.
+ * Install phase UI: catalog picking + install flow. Installed machines live
+ * on Home; when an install finishes, OK resets the phase and jumps there.
  */
 @Composable
 fun InstallPanel(
     installer: Installer,
     context: android.content.Context,
-    onBoot: (BootSpec) -> Unit,
+    onInstalled: () -> Unit,
 ) {
     var catalog by remember { mutableStateOf<List<CatalogImage>?>(null) }
     var catalogError by remember { mutableStateOf<String?>(null) }
@@ -48,7 +45,6 @@ fun InstallPanel(
     var user by remember { mutableStateOf("owner") }
     var password by remember { mutableStateOf("") }
     var hostname by remember { mutableStateOf("crate") }
-    var machines by remember { mutableStateOf(Installer.machines(context)) }
 
     LaunchedEffect(Unit) {
         Thread({
@@ -60,143 +56,111 @@ fun InstallPanel(
         }, "catalog-fetch").start()
     }
 
-    // Refresh the machine list after an install finishes.
-    LaunchedEffect(installer.phase) {
-        if (installer.phase is Installer.Phase.Done) {
-            machines = Installer.machines(context)
-        }
-    }
-
     Column(
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.verticalScroll(rememberScrollState()),
     ) {
-        Text("Installed VMs", fontSize = 16.sp)
-        if (machines.isEmpty()) {
-            Text("none yet", fontSize = 14.sp)
-        }
-        for (m in machines) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    "${m.name} ${m.version} ${m.desktop} (${m.memoryGB}G/${m.diskGB}G)",
-                    fontSize = 14.sp,
-                    modifier = Modifier.weight(1f),
-                )
-                TipIconButton(
-                    icon = Icons.Filled.PlayArrow,
-                    tip = "Boot ${m.name}",
-                    onClick = {
-                        val dir = File(Installer.vmsRoot(context), m.id)
-                        onBoot(
-                            BootSpec(
-                                kernel = File(dir, "vmlinuz").absolutePath,
-                                initrd = File(dir, "initrd.img").absolutePath,
-                                cmdline = m.cmdline,
-                                disk = File(dir, "disk.img").absolutePath,
-                                seed = File(dir, "seed.img").absolutePath,
-                                cpus = m.cpus,
-                                memoryMiB = m.memoryGB.toLong() * 1024,
-                            ),
-                        )
-                    },
-                    filled = true,
-                )
-            }
-        }
 
-        Text("Install from catalog", fontSize = 16.sp)
-        catalogError?.let { Text("catalog: $it", fontSize = 14.sp) }
-        val list = catalog
-        if (list == null && catalogError == null) {
-            Text("loading catalog…", fontSize = 14.sp)
-        }
-        list?.let {
-            for (img in it) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        "${img.name} ${img.version} ${img.desktop}",
-                        fontSize = 14.sp,
-                        modifier = Modifier.weight(1f),
-                    )
-                    TipIconButton(
-                        icon = if (selected?.id == img.id) Icons.Filled.RadioButtonChecked
-                            else Icons.Filled.RadioButtonUnchecked,
-                        tip = "Select ${img.name} ${img.version}",
-                        onClick = { selected = img },
-                        enabled = !installer.busy,
-                    )
+        SectionCard("Catalog") {
+            catalogError?.let { Text("catalog: $it", fontSize = 14.sp) }
+            val list = catalog
+            if (list == null && catalogError == null) {
+                Text("loading catalog…", fontSize = 14.sp)
+            }
+            list?.let {
+                for (img in it) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            "${img.name} ${img.version} ${img.desktop}",
+                            fontSize = 14.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TipIconButton(
+                            icon = if (selected?.id == img.id) Icons.Filled.RadioButtonChecked
+                                else Icons.Filled.RadioButtonUnchecked,
+                            tip = "Select ${img.name} ${img.version}",
+                            onClick = { selected = img },
+                            enabled = !installer.busy,
+                        )
+                    }
                 }
             }
         }
 
         selected?.let { img ->
-            Text("Install ${img.id} (${img.downloadBytes shr 20} MiB download)", fontSize = 14.sp)
-            TextField(value = user, onValueChange = { user = it },
-                label = { Text("user") }, singleLine = true)
-            TextField(value = password, onValueChange = { password = it },
-                label = { Text("password") }, singleLine = true,
-                visualTransformation = PasswordVisualTransformation())
-            TextField(value = hostname, onValueChange = { hostname = it },
-                label = { Text("hostname") }, singleLine = true)
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TipIconButton(
-                    icon = Icons.Filled.Download,
-                    tip = "Install",
-                    onClick = {
-                        installer.install(img, 4, 12, user, password, hostname)
-                    },
-                    enabled = !installer.busy && user.isNotBlank() && password.isNotEmpty(),
-                    filled = true,
-                )
-                TipIconButton(
-                    icon = Icons.Filled.Close,
-                    tip = "Cancel",
-                    onClick = { installer.cancel() },
-                    enabled = installer.busy,
-                )
+            SectionCard("New machine") {
+                Text("Install ${img.id} (${img.downloadBytes shr 20} MiB download)", fontSize = 14.sp)
+                TextField(value = user, onValueChange = { user = it },
+                    label = { Text("user") }, singleLine = true)
+                TextField(value = password, onValueChange = { password = it },
+                    label = { Text("password") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation())
+                TextField(value = hostname, onValueChange = { hostname = it },
+                    label = { Text("hostname") }, singleLine = true)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TipIconButton(
+                        icon = Icons.Filled.Download,
+                        tip = "Install",
+                        onClick = {
+                            installer.install(img, 4, 12, user, password, hostname)
+                        },
+                        enabled = !installer.busy && user.isNotBlank() && password.isNotEmpty(),
+                        filled = true,
+                    )
+                    TipIconButton(
+                        icon = Icons.Filled.Close,
+                        tip = "Cancel",
+                        onClick = { installer.cancel() },
+                        enabled = installer.busy,
+                    )
+                }
             }
         }
 
-        when (val p = installer.phase) {
-            is Installer.Phase.Downloading -> {
-                Text("downloading ${p.done shr 20}/${p.total shr 20} MiB", fontSize = 14.sp)
-                LinearProgressIndicator(
-                    progress = { (p.done.toFloat() / p.total.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+        val phase = installer.phase
+        if (phase !is Installer.Phase.Idle) {
+            SectionCard("Progress") {
+                when (val p = phase) {
+                    is Installer.Phase.Downloading -> {
+                        Text("downloading ${p.done shr 20}/${p.total shr 20} MiB", fontSize = 14.sp)
+                        LinearProgressIndicator(
+                            progress = { (p.done.toFloat() / p.total.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    is Installer.Phase.Unpacking -> {
+                        Text("unpacking ${p.done shr 20}/${p.total shr 20} MiB", fontSize = 14.sp)
+                        LinearProgressIndicator(
+                            progress = { (p.done.toFloat() / p.total.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    is Installer.Phase.Finishing -> Text("verifying + seeding…", fontSize = 14.sp)
+                    is Installer.Phase.Done -> {
+                        Text("installed ${p.machine.name} — tap OK to open it", fontSize = 14.sp)
+                        TipIconButton(
+                            icon = Icons.Filled.Check,
+                            tip = "OK",
+                            onClick = {
+                                installer.reset()
+                                onInstalled()
+                            },
+                        )
+                    }
+                    is Installer.Phase.Failed -> {
+                        Text("install failed: ${p.message}", fontSize = 14.sp)
+                        TipIconButton(
+                            icon = Icons.Filled.Check,
+                            tip = "OK",
+                            onClick = { installer.reset() },
+                        )
+                    }
+                    is Installer.Phase.Idle -> {}
+                }
             }
-            is Installer.Phase.Unpacking -> {
-                Text("unpacking ${p.done shr 20}/${p.total shr 20} MiB", fontSize = 14.sp)
-                LinearProgressIndicator(
-                    progress = { (p.done.toFloat() / p.total.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-            is Installer.Phase.Finishing -> Text("verifying + seeding…", fontSize = 14.sp)
-            is Installer.Phase.Done -> {
-                Text("installed ${p.machine.name} — tap Boot above", fontSize = 14.sp,
-                    modifier = Modifier.padding(top = 4.dp))
-                TipIconButton(
-                    icon = Icons.Filled.Check,
-                    tip = "OK",
-                    onClick = { installer.reset() },
-                )
-            }
-            is Installer.Phase.Failed -> {
-                Text("install failed: ${p.message}", fontSize = 14.sp)
-                TipIconButton(
-                    icon = Icons.Filled.Check,
-                    tip = "OK",
-                    onClick = { installer.reset() },
-                )
-            }
-            is Installer.Phase.Idle -> {}
         }
     }
 }
