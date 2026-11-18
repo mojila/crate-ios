@@ -123,6 +123,7 @@ class MainActivity : ComponentActivity() {
     private val engine: Engine get() = Engine.shared
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        CrashLog.install(this)
         super.onCreate(savedInstanceState)
         setContent {
             var mode by remember { mutableStateOf(ThemeMode.load(this)) }
@@ -169,6 +170,7 @@ private fun App(
                 engineVer = "engine 0x${v.toUInt().toString(16)}"
                 libsReady = true
             } catch (e: Exception) {
+                CrashLog.log(context.applicationContext, "load", "native load failed: ${e.message}", e)
                 loadError = e.message
             }
         }, "native-load").start()
@@ -304,6 +306,8 @@ private fun HomeScreen(
         busy = true
         bootError = null
         bootedName = name
+        val appContext = context.applicationContext
+        CrashLog.log(appContext, "boot", "booting $name (display=$displayAtBoot)")
         // A display boot lands in fullscreen: hide status + buttons.
         if (displayAtBoot) onControlsVisible(false)
         Thread({
@@ -325,10 +329,13 @@ private fun HomeScreen(
                 // Frames flow only while the display is active
                 // (mirrors iOS DisplayBridge.attach).
                 if (displayAtBoot) engine.setDisplayActive(true)
+                CrashLog.log(appContext, "boot", "$name started")
             } catch (e: EngineException) {
+                CrashLog.log(appContext, "boot", "$name failed: ${e.message}", e)
                 bootError = e.message
                 bootedName = null
             } catch (e: Exception) {
+                CrashLog.log(appContext, "boot", "$name failed: ${e.message}", e)
                 bootError = e.message
                 bootedName = null
             } finally {
@@ -340,10 +347,14 @@ private fun HomeScreen(
 
     /** Kill the machine, then free it so another OS can boot. */
     fun kill() {
+        val appContext = context.applicationContext
+        CrashLog.log(appContext, "boot", "kill requested")
         Thread({
             synchronized(bootLock) {
             try {
                 engine.kill()
+            } catch (e: Exception) {
+                CrashLog.log(appContext, "boot", "kill failed: ${e.message}", e)
             } finally {
                 // Let the state callback land, then free the machine.
                 try {
@@ -352,6 +363,7 @@ private fun HomeScreen(
                 }
                 engine.destroy()
                 bootedName = null
+                CrashLog.log(appContext, "boot", "machine freed")
             }
             }
         }, "vm-kill").start()

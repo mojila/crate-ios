@@ -35,13 +35,25 @@ object GuestDns {
         } catch (_: Exception) {
         }
         if (servers.isEmpty()) servers.addAll(FALLBACK)
+        // Link-local (fe80::/10, scope stripped above) and loopback are
+        // useless as slirp upstreams; IPv4 first (the v4 forward path).
+        fun usable(ip: String): Boolean {
+            if (ip.equals("::1", ignoreCase = true)) return false
+            if (ip.startsWith("127.", ignoreCase = true)) return false
+            if (ip.startsWith("fe80", ignoreCase = true)) return false
+            return true
+        }
+        val ordered = servers.filter { usable(it) }
+            .partition { it.contains('.') }
+            .let { (v4, v6) -> v4 + v6 }
+            .ifEmpty { FALLBACK }
         try {
             val dir = File(context.filesDir, "slirp")
             dir.mkdirs()
             val conf = File(dir, "resolv.conf")
             conf.writeText(buildString {
                 appendLine("# Crate: phone DNS for the guest, see SLIRP_RESOLV_CONF.")
-                servers.take(3).forEach { appendLine("nameserver $it") }
+                ordered.take(3).forEach { appendLine("nameserver $it") }
             })
             Os.setenv(ENV_VAR, conf.absolutePath, true)
         } catch (_: Exception) {

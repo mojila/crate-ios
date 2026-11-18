@@ -176,3 +176,11 @@ done
 ls "$OUT"
 echo "$STAMP" > "$REPO/android/libs/Native.version"
 echo "$STAMP in android/libs/"
+# The app loads these from assets/native (versioned SONAMEs aren't packaged
+# as jniLibs): keep the shipped copies in sync with this build, or the APK
+# silently carries a stale slirp.
+mkdir -p "$REPO/android/app/src/main/assets/native"
+cp -f "$OUT/libglib-2.0.so.0.9000.1" "$OUT/libslirp.so.0.4.0" \
+    "$REPO/android/app/src/main/assets/native/"
+cp -f "$REPO/android/libs/Native.version" \
+    "$REPO/android/app/src/main/assets/native/Native.version"
