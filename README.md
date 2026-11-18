@@ -76,6 +76,29 @@ JIT is then turned on by crate's built-in StikJIT or by StikDebug (see
 into Claude Code, which does them for you. crate is developed on an iPhone Duo
 with iOS 27.1.
 
+## Android
+
+This fork also builds crate for Android: the same engine (translation path,
+no `/dev/kvm`) with a native Android UI in `android/` — verified on a Samsung
+S22 (Snapdragon SM8450, stock Android 16). iOS is untouched; everything Android
+is additive (`android/`, `Scripts/android-*.sh`, `Scripts/patches/*-android.patch`).
+
+- **Install:** each [Android release](https://github.com/mojila/crate-ios/releases)
+  attaches a signed APK (`crate-android-vX.Y.Z.apk`, arm64, Android 13+):
+  `adb install -r crate-android-v0.1.0.apk`, or sideload it on the phone.
+- Home lists installed OSes with immediate boot, Install fetches the catalog
+  (Debian Xfce verified end to end), Settings holds theme + display-at-boot.
+- Display boots go fullscreen landscape; touchpad mode is default, a connected
+  physical mouse takes over automatically, and a paired Bluetooth keyboard
+  types into the guest.
+- The guest's upstream DNS is read from the phone (`SLIRP_RESOLV_CONF`, public
+  DNS fallback).
+
+Build it with `./Scripts/android-fetch-engine.sh`,
+`./Scripts/android-build-native.sh` (libslirp + its GLib), then
+`cd android && ./gradlew :app:assembleRelease`. [android/README.md](android/README.md)
+has the full build/run/install/UI notes.
+
 ## Gallery
 
 <table>
